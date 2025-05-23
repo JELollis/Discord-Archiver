@@ -27,7 +27,6 @@ tree = bot.tree
 async def on_ready():
     logging.info(f'Logged in as {bot.user}!')
     print(f'Logged in as {bot.user}!')
-
     try:
         # Sync commands globally
         await tree.sync()
@@ -38,33 +37,30 @@ async def on_ready():
 
 # Define slash command to archive
 @tree.command(name="archive", description="Archive channels and categories based on a term and year.")
-@app_commands.describe(
-    term="The term to archive (e.g., Spring, Summer, Fall)",
-    year="The year to archive (e.g., 2025)"
-)
+@app_commands.describe(term="The term to archive (e.g., Spring, Summer, Fall)", year="The year (e.g., 2025)")
 async def archive(interaction: discord.Interaction, term: str, year: int):
+    responded = False
     try:
         # Defer the interaction to allow processing time
         await interaction.response.defer(ephemeral=True)
-
+        responded = True
         logging.debug("Archive command invoked with term: %s, year: %d", term, year)
 
         # Validate inputs
         if term.lower() not in ["spring", "summer", "fall"]:
             await interaction.followup.send("Invalid term. Please specify: `Spring`, `Summer`, or `Fall`.", ephemeral=True)
             return
-
         if not (1900 <= year <= 2100):
             await interaction.followup.send("Invalid year. Please provide a valid year (e.g., 2025).", ephemeral=True)
             return
 
         term = term.lower()
         archive_category_name = f"{term.capitalize()} {year} Archive"
-
         guild = interaction.guild
 
         # Fetch the Verified role
         verified_role = discord.utils.get(guild.roles, name="Verified")
+
         if not verified_role:
             await interaction.followup.send("The 'Verified' role does not exist. Please create it first.", ephemeral=True)
             logging.error("Verified role not found.")
@@ -91,25 +87,25 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
 
                 # Apply archive-specific permissions
                 await channel.set_permissions(guild.default_role, read_messages=False, send_messages=False)
-                await channel.set_permissions(verified_role, read_messages=True, send_messages=False,
-                                              read_message_history=True)
-
+                await channel.set_permissions(verified_role, read_messages=True, send_messages=False, read_message_history=True)
                 moved_channels.append(channel.name)
                 logging.info("Channel '%s' moved to archive and permissions updated.", channel.name)
 
         if moved_channels:
-            await interaction.followup.send(
-                f"Archived channels: {', '.join(moved_channels)}.", ephemeral=True
-            )
+            await interaction.followup.send(f"Archived channels: {', '.join(moved_channels)}.", ephemeral=True)
         else:
-            await interaction.followup.send(
-                "No channels found matching the specified term and year.", ephemeral=True
-            )
-
+            await interaction.followup.send("No channels found matching the specified term and year.", ephemeral=True)
         logging.info("Archive process completed for %s %d.", term, year)
+
     except Exception as e:
-        logging.error("An error occurred: %s", str(e))
-        await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        logging.error("An error occurred in archive: %s", str(e))
+        try:
+            if not responded:
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            logging.warning("Interaction already responded when handling archive error.")
 
 # Define slash command to populate
 @tree.command(name="populate", description="Create categories and channels dynamically.")
@@ -134,35 +130,26 @@ async def populate(
     year: int,
     courses: str
 ):
+    responded = False
     try:
         # Defer the interaction to allow processing time
         await interaction.response.defer(ephemeral=True)
-
+        responded = True
         logging.debug("Populate command invoked with category: %s, term: %s, year: %d, courses: %s",
                       category.value, term, year, courses)
 
         # Validate the term
         if term.lower() not in ["spring", "summer", "fall"]:
-            await interaction.followup.send(
-                "Invalid term. Please specify a valid term: `Spring`, `Summer`, or `Fall`.",
-                ephemeral=True
-            )
-            logging.debug("Invalid term provided: %s", term)
+            await interaction.followup.send("Invalid term. Please specify: `Spring`, `Summer`, or `Fall`.", ephemeral=True)
             return
 
         if not (1900 <= year <= 2100):
-            await interaction.followup.send(
-                "Invalid year. Please provide a valid year (e.g., 2025).",
-                ephemeral=True
-            )
+            await interaction.followup.send("Invalid year. Please provide a valid year (e.g., 2025).", ephemeral=True)
             return
 
         course_numbers = [course.strip() for course in courses.split(",") if course.strip().isdigit()]
         if not course_numbers:
-            await interaction.followup.send(
-                "No valid course numbers provided. Please provide a comma-separated list of numbers.",
-                ephemeral=True
-            )
+            await interaction.followup.send("No valid course numbers provided. Please provide a comma-separated list of numbers.", ephemeral=True)
             return
 
         # Create the category if it does not exist
@@ -179,16 +166,14 @@ async def populate(
             channel_name = f"{category_name}-{course_number}-{term.capitalize()}-{year}"
             existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
             if not existing_channel:
-                role_name = f"{category_name}-{course_number}"  # Role format
+                role_name = f"{category_name}-{course_number}"
                 role = discord.utils.get(guild.roles, name=role_name)
-
                 if not role:
                     logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
-                    continue  # Skip creating channel if the role doesn't exist
-
+                    continue
                 overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(read_messages=False),  # Make channel private
-                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True),  # Assign role permissions
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
                 }
                 new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
                 created_channels.append(new_channel.name)
@@ -200,7 +185,13 @@ async def populate(
             await interaction.followup.send("No new channels were created. All channels already exist or roles were missing.", ephemeral=True)
 
     except Exception as e:
-        logging.error("An error occurred: %s", str(e))
-        await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        logging.error("An error occurred in populate: %s", str(e))
+        try:
+            if not responded:
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            logging.warning("Interaction already responded when handling populate error.")
 
 bot.run('{API_Key}')
