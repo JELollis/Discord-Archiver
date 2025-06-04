@@ -18,6 +18,9 @@ logging.basicConfig(
 
 logging.info("Bot starting up.")
 
+with open("Bot Key.txt", "r", encoding="utf-8") as key_file:
+    TOKEN = key_file.readline().strip()
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -168,12 +171,14 @@ async def populate(
             if not existing_channel:
                 role_name = f"{category_name}-{course_number}"
                 role = discord.utils.get(guild.roles, name=role_name)
+                lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
                 if not role:
                     logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
                     continue
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(read_messages=False),
                     role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                    lab_tech_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True)
                 }
                 new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
                 created_channels.append(new_channel.name)
@@ -194,4 +199,4 @@ async def populate(
         except discord.errors.InteractionResponded:
             logging.warning("Interaction already responded when handling populate error.")
 
-bot.run('{API_Key}')
+bot.run(TOKEN)
