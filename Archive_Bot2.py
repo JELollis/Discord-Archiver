@@ -120,6 +120,7 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
 )
 @app_commands.choices(category=[
     app_commands.Choice(name="CPT", value="CPT"),
+    app_commands.Choice(name="CYB", value="CYB"),
     app_commands.Choice(name="IST", value="IST"),
     app_commands.Choice(name="SPC", value="SPC"),
     app_commands.Choice(name="SOC", value="SOC"),
@@ -198,5 +199,138 @@ async def populate(
                 await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
         except discord.errors.InteractionResponded:
             logging.warning("Interaction already responded when handling populate error.")
+
+# ---- Shared permissions helper for course roles ----
+def build_course_permissions() -> discord.Permissions:
+    perms = discord.Permissions.none()
+
+    # Text / Threads / Forum “Posts”
+    perms.view_channel = True
+    perms.change_nickname = True
+    perms.send_messages = True
+    perms.send_messages_in_threads = True
+    perms.create_public_threads = True
+    if hasattr(discord.Permissions, "create_forum_threads"):
+        perms.create_forum_threads = True  # forum posts
+
+    perms.embed_links = True
+    perms.attach_files = True
+    perms.add_reactions = True
+    perms.read_message_history = True
+    perms.use_application_commands = True
+
+    # Emoji/Stickers
+    perms.use_external_emojis = True
+    if hasattr(discord.Permissions, "use_external_stickers"):
+        perms.use_external_stickers = True
+
+    # Voice/Activities
+    perms.connect = True
+    perms.speak = True
+    perms.stream = True  # “Video”/Go Live
+    if hasattr(discord.Permissions, "use_embedded_activities"):
+        perms.use_embedded_activities = True
+
+    return perms
+
+
+# ---- /add_role command (creates missing; updates permissions on existing) ----
+@tree.command(name="add_role", description="Create or update course roles for a category (e.g., CYB 110, 201, 269)")
+@app_commands.describe(
+    category="Course category (CPT, CYB, IST, SPC, SOC, HSS, HIS)",
+    courses="Comma-separated list of course numbers (e.g., 110, 201, 269)"
+)
+@app_commands.choices(category=[
+    app_commands.Choice(name="CPT", value="CPT"),
+    app_commands.Choice(name="CYB", value="CYB"),
+    app_commands.Choice(name="IST", value="IST"),
+    app_commands.Choice(name="SPC", value="SPC"),
+    app_commands.Choice(name="SOC", value="SOC"),
+    app_commands.Choice(name="HSS", value="HSS"),
+    app_commands.Choice(name="HIS", value="HIS"),
+])
+async def add_role(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+    courses: str
+):
+    responded = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        responded = True
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+            return
+
+        # Parse numbers
+        course_numbers = [c.strip() for c in courses.split(",") if c.strip().isdigit()]
+        if not course_numbers:
+            await interaction.followup.send("No valid course numbers provided. Use a comma-separated list of numbers.", ephemeral=True)
+            return
+
+        perms = build_course_permissions()
+        created, updated, unchanged = [], [], []
+
+        for num in course_numbers:
+            role_name = f"{category.value}-{num}"
+            role = discord.utils.get(guild.roles, name=role_name)
+
+            # Create if missing
+            if role is None:
+                try:
+                    role = await guild.create_role(
+                        name=role_name,
+                        permissions=perms,
+                        reason=f"Auto-created by /add_role for {category.value} {num}"
+                    )
+                    created.append(role_name)
+                    continue
+                except discord.Forbidden:
+                    await interaction.followup.send(
+                        f"❌ Missing permissions to create role `{role_name}` (need Manage Roles, and my top role must be above it).",
+                        ephemeral=True
+                    )
+                    return
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Error creating `{role_name}`: {e}", ephemeral=True)
+                    return
+
+            # Update perms if different
+            try:
+                if role.permissions != perms:
+                    await role.edit(permissions=perms, reason=f"Sync perms via /add_role for {category.value} {num}")
+                    updated.append(role_name)
+                else:
+                    unchanged.append(role_name)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"❌ I can't edit `{role_name}`. Ensure I have Manage Roles and my top role is above `{role_name}`.",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                await interaction.followup.send(f"❌ Error updating `{role_name}`: {e}", ephemeral=True)
+                return
+
+        # Summary
+        lines = []
+        if created:   lines.append(f"✅ Created: {', '.join(created)}")
+        if updated:   lines.append(f"🔁 Updated perms: {', '.join(updated)}")
+        if unchanged: lines.append(f"✔️ Already correct: {', '.join(unchanged)}")
+        if not lines: lines.append("No changes made.")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    except Exception as e:
+        logging.error("An error occurred in add_role: %s", str(e))
+        try:
+            if not responded:
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            logging.warning("Interaction already responded when handling add_role error.")
 
 bot.run(TOKEN)
