@@ -1,0 +1,4 @@
+# Discord-Archiver runtime dependencies
+# Pin a version new enough for app_commands and the forum/sticker/activity
+# permission flags used in Archive_Bot2.py.
+discord.py>=2.3.2

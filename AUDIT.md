@@ -4,8 +4,19 @@
 **Primary subject:** `Archive_Bot2.py` (the file currently run in production)
 **Supporting files reviewed:** `Archive_Bot.py`, `archive.py`, `quick_update.py`, `roles_generator.py`, `README.md`, `.gitignore`, `.gitattributes`
 
-This is an analysis-only document. No production behavior was changed. Each
-finding lists severity, the concrete failure mode, and a recommended fix.
+Each finding lists severity, the concrete failure mode, and a recommended fix.
+
+> **Remediation status (2026-07-19):** Findings **#1–#10 and #14 are now fixed
+> in `Archive_Bot2.py`** (and a new `requirements.txt`). Fixes were verified by
+> importing the module against `discord.py` 2.7.1 and asserting that every
+> command registers with `guild_only` + the correct `default_permissions` +
+> a permission check, that the error handler is wired, and that the new
+> anchored `/archive` matcher rejects near-miss channel names. The remaining
+> items are repo-hygiene/behavior decisions left to the maintainer:
+> **#11** (untrack vs. un-ignore `quick_update.py`), **#12** (remove/relocate
+> the legacy prototype scripts), and **#13** (archived-channel access policy —
+> flagged as a deliberate choice to confirm, not a bug). The per-finding
+> "Fix" sections below describe what was applied.
 
 ---
 
@@ -21,22 +32,22 @@ command behind an admin/role check. There is also one guaranteed crash path in
 `/populate` and several robustness/operational issues that matter at the scale
 of a real course server.
 
-| # | Severity | Area | Finding |
-|---|----------|------|---------|
-| 1 | **Critical** | Security | Slash commands have no permission gate — any member can archive/populate/create roles |
-| 2 | Medium | Security | `message_content` privileged intent requested but unused |
-| 3 | **High** | Correctness | `/populate` crashes when the `Lab Tech` role is missing (unchecked `None` overwrite key) |
-| 4 | Medium | Correctness | `/archive` and `/populate` have no `guild_only` / `guild is None` guard |
-| 5 | Medium | Correctness | `/archive` uses an unanchored substring match for channel names |
-| 6 | Medium | Reliability | `/archive` permission rewrite makes many serial API calls — rate-limit / 15-min token expiry risk |
-| 7 | Medium | Reliability | `tree.sync()` runs on every `on_ready` (re-syncs on every reconnect) |
-| 8 | Low | Security | Raw exception text (`str(e)`) is surfaced to users |
-| 9 | Low | Reliability | `Bot Key.txt` read is unguarded, relative-path, no env fallback |
-| 10 | Low | Robustness | `/add_role` aborts the whole batch on the first `Forbidden` |
-| 11 | Low | Hygiene | `quick_update.py` is committed *and* listed in `.gitignore` |
-| 12 | Low | Hygiene | Legacy/dead files with placeholder tokens; no doc of which file is production |
-| 13 | Info | Behavior | Archiving grants read only to `Verified`; the course role loses access |
-| 14 | Low | Ops | No `requirements.txt` / pinned `discord.py`; `hasattr` version guards imply uncertainty |
+| # | Severity | Area | Finding | Status |
+|---|----------|------|---------|--------|
+| 1 | **Critical** | Security | Slash commands have no permission gate — any member can archive/populate/create roles | ✅ Fixed |
+| 2 | Medium | Security | `message_content` privileged intent requested but unused | ✅ Fixed |
+| 3 | **High** | Correctness | `/populate` crashes when the `Lab Tech` role is missing (unchecked `None` overwrite key) | ✅ Fixed |
+| 4 | Medium | Correctness | `/archive` and `/populate` have no `guild_only` / `guild is None` guard | ✅ Fixed |
+| 5 | Medium | Correctness | `/archive` uses an unanchored substring match for channel names | ✅ Fixed |
+| 6 | Medium | Reliability | `/archive` permission rewrite makes many serial API calls — rate-limit / 15-min token expiry risk | ✅ Fixed |
+| 7 | Medium | Reliability | `tree.sync()` runs on every `on_ready` (re-syncs on every reconnect) | ✅ Fixed |
+| 8 | Low | Security | Raw exception text (`str(e)`) is surfaced to users | ✅ Fixed |
+| 9 | Low | Reliability | `Bot Key.txt` read is unguarded, relative-path, no env fallback | ✅ Fixed |
+| 10 | Low | Robustness | `/add_role` aborts the whole batch on the first `Forbidden` | ✅ Fixed |
+| 11 | Low | Hygiene | `quick_update.py` is committed *and* listed in `.gitignore` | ⏳ Maintainer decision |
+| 12 | Low | Hygiene | Legacy/dead files with placeholder tokens; no doc of which file is production | ⏳ Maintainer decision |
+| 13 | Info | Behavior | Archiving grants read only to `Verified`; the course role loses access | ⏳ Confirm intent |
+| 14 | Low | Ops | No `requirements.txt` / pinned `discord.py`; `hasattr` version guards imply uncertainty | ✅ Fixed |
 
 ---
 

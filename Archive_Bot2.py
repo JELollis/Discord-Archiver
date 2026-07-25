@@ -3,7 +3,9 @@ from discord.ext import commands
 from discord import app_commands
 import datetime
 import os
+import re
 import logging
+from pathlib import Path
 
 # Setup logging
 log_directory = "logs"
@@ -18,28 +20,89 @@ logging.basicConfig(
 
 logging.info("Bot starting up.")
 
-with open("Bot Key.txt", "r", encoding="utf-8") as key_file:
-    TOKEN = key_file.readline().strip()
 
+def load_token() -> str:
+    """Load the bot token from the DISCORD_TOKEN env var, falling back to the
+    'Bot Key.txt' file located next to this script."""
+    env_token = os.environ.get("DISCORD_TOKEN")
+    if env_token:
+        return env_token.strip()
+    key_path = Path(__file__).parent / "Bot Key.txt"
+    try:
+        with open(key_path, "r", encoding="utf-8") as key_file:
+            return key_file.readline().strip()
+    except FileNotFoundError:
+        raise SystemExit(
+            f"No bot token found. Set the DISCORD_TOKEN environment variable or "
+            f"create '{key_path}'."
+        )
+
+
+TOKEN = load_token()
+
+# Slash-command-only bot: no privileged message_content intent required.
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
+_commands_synced = False
+
+
 @bot.event
 async def on_ready():
+    global _commands_synced
     logging.info(f'Logged in as {bot.user}!')
     print(f'Logged in as {bot.user}!')
+    # on_ready can fire on every reconnect; sync the global command tree only once.
+    if _commands_synced:
+        return
     try:
-        # Sync commands globally
         await tree.sync()
+        _commands_synced = True
         logging.info("Slash commands synchronized globally.")
     except Exception as e:
         logging.error("Error syncing commands: %s", str(e))
         print(f"Error syncing commands: {str(e)}")
 
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Present permission/usage errors cleanly; log everything else without
+    leaking internals to users."""
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "🚫 You don't have permission to use this command."
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        message = "This command can only be used in a server."
+    else:
+        logging.error("Unhandled app command error: %s", error, exc_info=error)
+        message = "⚠️ Something went wrong while processing this command. An admin can check the logs."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.errors.InteractionResponded:
+        logging.warning("Interaction already responded when handling app command error.")
+
+
+async def respond_error(interaction: discord.Interaction, responded: bool, label: str, exc: Exception):
+    """Log the real exception and show the user a generic, non-leaky message."""
+    logging.error("An error occurred in %s: %s", label, exc, exc_info=exc)
+    message = "⚠️ Something went wrong while processing this command. An admin can check the logs."
+    try:
+        if not responded:
+            await interaction.response.send_message(message, ephemeral=True)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+    except discord.errors.InteractionResponded:
+        logging.warning("Interaction already responded when handling %s error.", label)
+
+
 # Define slash command to archive
 @tree.command(name="archive", description="Archive channels and categories based on a term and year.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.checks.has_permissions(manage_channels=True)
 @app_commands.describe(term="The term to archive (e.g., Spring, Summer, Fall)", year="The year (e.g., 2025)")
 async def archive(interaction: discord.Interaction, term: str, year: int):
     responded = False
@@ -77,20 +140,23 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
             await archive_category.set_permissions(verified_role, read_messages=True, send_messages=False, read_message_history=True)
             logging.info("Archive category '%s' created.", archive_category_name)
 
+        # Match channels named like "<cat>-<course>-<term>-<year>" (anchored, so
+        # we don't sweep in "...-fall-2025-backup" or similar).
+        channel_pattern = re.compile(rf'^[a-z]+-\d+-{re.escape(term)}-{year}$')
+
+        # Full overwrite set applied to each archived channel in a single edit.
+        archive_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False, send_messages=False),
+            verified_role: discord.PermissionOverwrite(read_messages=True, send_messages=False, read_message_history=True),
+        }
+
         # Find and move matching channels
         moved_channels = []
         for channel in guild.text_channels:
             logging.debug("Checking channel: %s", channel.name)
-            if f"-{term}-{year}" in channel.name.lower():
-                await channel.edit(category=archive_category)
-
-                # Clear all existing permissions
-                for target in list(channel.overwrites.keys()):
-                    await channel.set_permissions(target, overwrite=None)
-
-                # Apply archive-specific permissions
-                await channel.set_permissions(guild.default_role, read_messages=False, send_messages=False)
-                await channel.set_permissions(verified_role, read_messages=True, send_messages=False, read_message_history=True)
+            if channel_pattern.match(channel.name.lower()):
+                # Move and replace all permission overwrites in a single API call.
+                await channel.edit(category=archive_category, overwrites=archive_overwrites)
                 moved_channels.append(channel.name)
                 logging.info("Channel '%s' moved to archive and permissions updated.", channel.name)
 
@@ -101,17 +167,13 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
         logging.info("Archive process completed for %s %d.", term, year)
 
     except Exception as e:
-        logging.error("An error occurred in archive: %s", str(e))
-        try:
-            if not responded:
-                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            logging.warning("Interaction already responded when handling archive error.")
+        await respond_error(interaction, responded, "archive", e)
 
 # Define slash command to populate
 @tree.command(name="populate", description="Create categories and channels dynamically.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.checks.has_permissions(manage_channels=True)
 @app_commands.describe(
     category="Select or create a category",
     term="Specify the term (Spring, Summer, Fall)",
@@ -165,6 +227,7 @@ async def populate(
             logging.info("Category '%s' created.", category_name)
 
         # Create channels under the category as private and assign roles
+        lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
         created_channels = []
         for course_number in course_numbers:
             channel_name = f"{category_name}-{course_number}-{term.capitalize()}-{year}"
@@ -172,15 +235,20 @@ async def populate(
             if not existing_channel:
                 role_name = f"{category_name}-{course_number}"
                 role = discord.utils.get(guild.roles, name=role_name)
-                lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
                 if not role:
                     logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
                     continue
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(read_messages=False),
                     role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                    lab_tech_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True)
                 }
+                # Only add the Lab Tech overwrite if the role actually exists;
+                # a None key would make create_text_channel raise.
+                if lab_tech_role:
+                    overwrites[lab_tech_role] = discord.PermissionOverwrite(
+                        read_messages=True, send_messages=True, read_message_history=True)
+                else:
+                    logging.warning("Lab Tech role not found; creating '%s' without it.", channel_name)
                 new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
                 created_channels.append(new_channel.name)
                 logging.info("Channel '%s' created as private with role '%s' assigned.", new_channel.name, role_name)
@@ -191,14 +259,7 @@ async def populate(
             await interaction.followup.send("No new channels were created. All channels already exist or roles were missing.", ephemeral=True)
 
     except Exception as e:
-        logging.error("An error occurred in populate: %s", str(e))
-        try:
-            if not responded:
-                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            logging.warning("Interaction already responded when handling populate error.")
+        await respond_error(interaction, responded, "populate", e)
 
 # ---- Shared permissions helper for course roles ----
 def build_course_permissions() -> discord.Permissions:
@@ -236,6 +297,9 @@ def build_course_permissions() -> discord.Permissions:
 
 # ---- /add_role command (creates missing; updates permissions on existing) ----
 @tree.command(name="add_role", description="Create or update course roles for a category (e.g., CYB 110, 201, 269)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.describe(
     category="Course category (CPT, CYB, IST, SPC, SOC, HSS, HIS)",
     courses="Comma-separated list of course numbers (e.g., 110, 201, 269)"
@@ -271,7 +335,7 @@ async def add_role(
             return
 
         perms = build_course_permissions()
-        created, updated, unchanged = [], [], []
+        created, updated, unchanged, failed = [], [], [], []
 
         for num in course_numbers:
             role_name = f"{category.value}-{num}"
@@ -286,16 +350,12 @@ async def add_role(
                         reason=f"Auto-created by /add_role for {category.value} {num}"
                     )
                     created.append(role_name)
-                    continue
                 except discord.Forbidden:
-                    await interaction.followup.send(
-                        f"❌ Missing permissions to create role `{role_name}` (need Manage Roles, and my top role must be above it).",
-                        ephemeral=True
-                    )
-                    return
+                    failed.append(f"{role_name} (missing permission to create)")
                 except Exception as e:
-                    await interaction.followup.send(f"❌ Error creating `{role_name}`: {e}", ephemeral=True)
-                    return
+                    logging.error("Error creating role '%s': %s", role_name, e, exc_info=e)
+                    failed.append(f"{role_name} (create error)")
+                continue
 
             # Update perms if different
             try:
@@ -305,32 +365,22 @@ async def add_role(
                 else:
                     unchanged.append(role_name)
             except discord.Forbidden:
-                await interaction.followup.send(
-                    f"❌ I can't edit `{role_name}`. Ensure I have Manage Roles and my top role is above `{role_name}`.",
-                    ephemeral=True
-                )
-                return
+                failed.append(f"{role_name} (missing permission to edit)")
             except Exception as e:
-                await interaction.followup.send(f"❌ Error updating `{role_name}`: {e}", ephemeral=True)
-                return
+                logging.error("Error updating role '%s': %s", role_name, e, exc_info=e)
+                failed.append(f"{role_name} (update error)")
 
         # Summary
         lines = []
         if created:   lines.append(f"✅ Created: {', '.join(created)}")
         if updated:   lines.append(f"🔁 Updated perms: {', '.join(updated)}")
         if unchanged: lines.append(f"✔️ Already correct: {', '.join(unchanged)}")
+        if failed:    lines.append(f"⚠️ Failed: {', '.join(failed)}")
         if not lines: lines.append("No changes made.")
 
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     except Exception as e:
-        logging.error("An error occurred in add_role: %s", str(e))
-        try:
-            if not responded:
-                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
-        except discord.errors.InteractionResponded:
-            logging.warning("Interaction already responded when handling add_role error.")
+        await respond_error(interaction, responded, "add_role", e)
 
 bot.run(TOKEN)
