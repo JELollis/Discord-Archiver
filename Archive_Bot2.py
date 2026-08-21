@@ -165,6 +165,10 @@ async def populate(
             logging.info("Category '%s' created.", category_name)
 
         # Create channels under the category as private and assign roles
+        lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
+        if lab_tech_role is None:
+            logging.warning("Lab Tech role not found; channels will be created without Lab Tech access.")
+
         created_channels = []
         for course_number in course_numbers:
             channel_name = f"{category_name}-{course_number}-{term.capitalize()}-{year}"
@@ -172,21 +176,28 @@ async def populate(
             if not existing_channel:
                 role_name = f"{category_name}-{course_number}"
                 role = discord.utils.get(guild.roles, name=role_name)
-                lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
                 if not role:
                     logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
                     continue
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                    lab_tech_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True)
+                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
                 }
+                if lab_tech_role is not None:
+                    overwrites[lab_tech_role] = discord.PermissionOverwrite(
+                        read_messages=True,
+                        send_messages=True,
+                        read_message_history=True
+                    )
                 new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
                 created_channels.append(new_channel.name)
                 logging.info("Channel '%s' created as private with role '%s' assigned.", new_channel.name, role_name)
 
         if created_channels:
-            await interaction.followup.send(f"Created private channels with roles: {', '.join(created_channels)}", ephemeral=True)
+            message = f"Created private channels with roles: {', '.join(created_channels)}"
+            if lab_tech_role is None:
+                message += "\n⚠️ The `Lab Tech` role was not found, so these channels were created without Lab Tech access."
+            await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.followup.send("No new channels were created. All channels already exist or roles were missing.", ephemeral=True)
 
@@ -332,5 +343,180 @@ async def add_role(
                 await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
         except discord.errors.InteractionResponded:
             logging.warning("Interaction already responded when handling add_role error.")
+
+
+# ---- /delete confirmation UI ----
+class DeleteConfirmationView(discord.ui.View):
+    """Confirmation controls and deletion state for a single `/delete` request.
+
+    Only the member who invoked the command may use the controls. Channels are
+    deleted before categories so category deletion never leaves selected child
+    channels behind. Individual failures are collected and reported instead of
+    stopping the remainder of the deletion operation.
+    """
+
+    def __init__(self, requester_id: int, channels, categories):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+        self.channels = channels
+        self.categories = categories
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Prevent anyone except the original requester from confirming/cancelling."""
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the user who ran `/delete` can confirm this deletion.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Perform the confirmed deletion and report successes/failures."""
+        # Acknowledge immediately because a large category can take several seconds.
+        await interaction.response.defer(ephemeral=True)
+
+        # Disable the controls so the same deletion cannot be submitted twice.
+        for child in self.children:
+            child.disabled = True
+
+        deleted_channels = []
+        deleted_categories = []
+        failures = []
+
+        # Delete child/standalone channels first, then their categories.
+        for channel in self.channels:
+            try:
+                await channel.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
+                deleted_channels.append(channel.name)
+                logging.info("Channel '%s' (%s) deleted by %s (%s).", channel.name, channel.id, interaction.user, interaction.user.id)
+            except Exception as e:
+                failures.append(f"channel `{channel.name}`: {e}")
+                logging.exception("Failed deleting channel '%s' (%s).", channel.name, channel.id)
+
+        # Categories are removed after all selected child channels have been attempted.
+        for category in self.categories:
+            try:
+                await category.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
+                deleted_categories.append(category.name)
+                logging.info("Category '%s' (%s) deleted by %s (%s).", category.name, category.id, interaction.user, interaction.user.id)
+            except Exception as e:
+                failures.append(f"category `{category.name}`: {e}")
+                logging.exception("Failed deleting category '%s' (%s).", category.name, category.id)
+
+        # Replace the confirmation prompt with the final result.
+        lines = [f"Deletion complete: {len(deleted_categories)} categor{'y' if len(deleted_categories) == 1 else 'ies'} and {len(deleted_channels)} channel{'s' if len(deleted_channels) != 1 else ''} deleted."]
+        if failures:
+            lines.append("Failures:\n" + "\n".join(f"- {failure}" for failure in failures[:15]))
+        await interaction.edit_original_response(content="\n".join(lines), view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Cancel the pending deletion without changing the server."""
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Deletion cancelled. Nothing was deleted.", view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        """Disable the local controls when the 60-second confirmation window expires."""
+        for child in self.children:
+            child.disabled = True
+
+
+# ---- /delete command (bulk category/channel deletion with confirmation) ----
+@tree.command(name="delete", description="Bulk-delete channels, categories, or both by name.")
+@app_commands.describe(
+    target_type="What kind of targets to delete",
+    targets="Comma-separated list of channel/category names"
+)
+@app_commands.choices(target_type=[
+    app_commands.Choice(name="Category", value="category"),
+    app_commands.Choice(name="Channel", value="channel"),
+    app_commands.Choice(name="Both", value="both"),
+])
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def delete(interaction: discord.Interaction, target_type: app_commands.Choice[str], targets: str):
+    """Resolve requested Discord channels/categories and request deletion confirmation.
+
+    `targets` is a comma-separated list matched case-insensitively by exact
+    Discord name. Category mode selects each matching category plus all child
+    channels. Channel mode selects only matching non-category channels. Both
+    mode allows either kind of target. No destructive action occurs until the
+    invoking member presses the confirmation button.
+    """
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    # The decorator controls command visibility, while this runtime check also
+    # protects execution if Discord's cached command permissions are stale.
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("You need the Manage Channels permission to use `/delete`.", ephemeral=True)
+        return
+
+    # Normalize the comma-separated input while preserving original spelling
+    # for useful missing-target messages.
+    names = [name.strip() for name in targets.split(",") if name.strip()]
+    if not names:
+        await interaction.response.send_message("Provide at least one channel or category name.", ephemeral=True)
+        return
+
+    # Case-insensitive exact-name matching. Duplicate names are all included so
+    # the confirmation accurately represents what Discord will delete.
+    wanted = {name.casefold() for name in names}
+    matched_categories = []
+    matched_channels = []
+
+    # Resolve categories when Category or Both mode was selected.
+    if target_type.value in ("category", "both"):
+        matched_categories = [category for category in guild.categories if category.name.casefold() in wanted]
+
+    # Resolve every non-category Discord channel type in Channel or Both mode.
+    if target_type.value in ("channel", "both"):
+        matched_channels = [channel for channel in guild.channels if not isinstance(channel, discord.CategoryChannel) and channel.name.casefold() in wanted]
+
+    # Selecting a category means deleting the category and everything in it.
+    # Include all channel types exposed through CategoryChannel.channels.
+    for category in matched_categories:
+        for channel in category.channels:
+            if channel not in matched_channels:
+                matched_channels.append(channel)
+
+    # Determine which user-supplied names never resolved to an applicable target.
+    found_names = {category.name.casefold() for category in matched_categories}
+    found_names.update(channel.name.casefold() for channel in matched_channels if channel.category not in matched_categories)
+    missing = [name for name in names if name.casefold() not in found_names]
+
+    if not matched_categories and not matched_channels:
+        await interaction.response.send_message("No matching channels or categories were found. Nothing was deleted.", ephemeral=True)
+        return
+
+    # List categories and explicitly selected standalone channels separately;
+    # child channels are represented by the total count to keep the prompt sane.
+    category_names = ", ".join(f"`{category.name}`" for category in matched_categories) or "None"
+    standalone_channels = [channel for channel in matched_channels if channel.category not in matched_categories]
+    channel_names = ", ".join(f"`{channel.name}`" for channel in standalone_channels) or "None"
+
+    # Present the complete impact before creating the destructive controls.
+    message = (
+        "**Permanent deletion confirmation**\n"
+        f"This will permanently delete **{len(matched_categories)}** categor{'y' if len(matched_categories) == 1 else 'ies'} "
+        f"and **{len(matched_channels)}** channel{'s' if len(matched_channels) != 1 else ''}.\n\n"
+        f"Categories: {category_names}\n"
+        f"Standalone channels: {channel_names}"
+    )
+    if missing:
+        message += "\n\nNot found: " + ", ".join(f"`{name}`" for name in missing)
+    message += "\n\nThis cannot be undone."
+
+    # Log both the original request and the resolved Discord objects for auditability.
+    logging.info("Delete requested by %s (%s): type=%s targets=%s; resolved categories=%s channels=%s missing=%s", interaction.user, interaction.user.id, target_type.value, names, [c.name for c in matched_categories], [c.name for c in matched_channels], missing)
+
+    # Only the invoking member can activate this confirmation view.
+    view = DeleteConfirmationView(interaction.user.id, matched_channels, matched_categories)
+    await interaction.response.send_message(message, view=view, ephemeral=True)
+
 
 bot.run(TOKEN)
