@@ -165,6 +165,10 @@ async def populate(
             logging.info("Category '%s' created.", category_name)
 
         # Create channels under the category as private and assign roles
+        lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
+        if lab_tech_role is None:
+            logging.warning("Lab Tech role not found; channels will be created without Lab Tech access.")
+
         created_channels = []
         for course_number in course_numbers:
             channel_name = f"{category_name}-{course_number}-{term.capitalize()}-{year}"
@@ -172,21 +176,28 @@ async def populate(
             if not existing_channel:
                 role_name = f"{category_name}-{course_number}"
                 role = discord.utils.get(guild.roles, name=role_name)
-                lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
                 if not role:
                     logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
                     continue
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                    lab_tech_role: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True)
+                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
                 }
+                if lab_tech_role is not None:
+                    overwrites[lab_tech_role] = discord.PermissionOverwrite(
+                        read_messages=True,
+                        send_messages=True,
+                        read_message_history=True
+                    )
                 new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
                 created_channels.append(new_channel.name)
                 logging.info("Channel '%s' created as private with role '%s' assigned.", new_channel.name, role_name)
 
         if created_channels:
-            await interaction.followup.send(f"Created private channels with roles: {', '.join(created_channels)}", ephemeral=True)
+            message = f"Created private channels with roles: {', '.join(created_channels)}"
+            if lab_tech_role is None:
+                message += "\n⚠️ The `Lab Tech` role was not found, so these channels were created without Lab Tech access."
+            await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.followup.send("No new channels were created. All channels already exist or roles were missing.", ephemeral=True)
 
