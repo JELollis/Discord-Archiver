@@ -66,31 +66,70 @@ def wiki_page_url(title: str) -> str:
     return f"{base}/index.php/" + urllib.parse.quote(title.replace(" ", "_"), safe="/:")
 
 
+def _message_dict(m, guild) -> dict:
+    """Serialise one Discord message into the archive dict shape."""
+    return {
+        "id": m.id,
+        "author": getattr(m.author, "display_name", str(m.author)),
+        "author_username": getattr(m.author, "name", None),
+        "author_id": m.author.id,
+        "created": m.created_at,
+        "edited": m.edited_at,
+        "content": discord_export.resolve_mentions(
+            m.content, guild,
+            members={x.id: x for x in getattr(m, "mentions", [])},
+            channels={x.id: x for x in getattr(m, "channel_mentions", [])},
+            roles={x.id: x for x in getattr(m, "role_mentions", [])},
+        ),
+        "attachments": [
+            {"id": a.id, "filename": a.filename, "size": a.size,
+             "content_type": a.content_type, "_obj": a}
+            for a in m.attachments
+        ],
+        "reply_to": m.reference.message_id if m.reference else None,
+    }
+
+
+async def _iter_threads(channel):
+    """Yield a channel's active + archived (public and, if permitted, private) threads, de-duplicated."""
+    seen = set()
+    for th in list(getattr(channel, "threads", [])):
+        if th.id not in seen:
+            seen.add(th.id)
+            yield th
+    for kwargs in ({}, {"private": True}):
+        try:
+            async for th in channel.archived_threads(limit=None, **kwargs):
+                if th.id not in seen:
+                    seen.add(th.id)
+                    yield th
+        except Exception:
+            pass  # missing permission / unsupported channel type -> skip
+
+
 async def capture_channel(channel: discord.TextChannel) -> list:
-    """Read a text channel's full history (oldest first) into serialisable dicts."""
+    """Read a channel's full history AND all its threads (oldest first).
+
+    Returns a flat list; each thread is introduced by a ``{"thread_header": name}``
+    marker entry followed by that thread's messages, so splitting/rendering handle
+    threads uniformly and no thread content is lost before deletion.
+    """
+    guild = channel.guild
     messages = []
     async for m in channel.history(limit=None, oldest_first=True):
+        messages.append(_message_dict(m, guild))
+    async for thread in _iter_threads(channel):
+        thread_messages = []
+        try:
+            async for m in thread.history(limit=None, oldest_first=True):
+                thread_messages.append(_message_dict(m, guild))
+        except Exception as exc:
+            logging.warning("Could not read thread '%s' in #%s: %s", getattr(thread, "name", "?"), channel.name, exc)
         messages.append({
-            "id": m.id,
-            "author": getattr(m.author, "display_name", str(m.author)),
-            "author_username": getattr(m.author, "name", None),
-            "author_id": m.author.id,
-            "created": m.created_at,
-            "edited": m.edited_at,
-            "content": discord_export.resolve_mentions(
-                m.content,
-                channel.guild,
-                members={member.id: member for member in getattr(m, "mentions", [])},
-                channels={mentioned.id: mentioned for mentioned in getattr(m, "channel_mentions", [])},
-                roles={role.id: role for role in getattr(m, "role_mentions", [])},
-            ),
-            "attachments": [
-                {"id": a.id, "filename": a.filename, "size": a.size,
-                 "content_type": a.content_type, "_obj": a}
-                for a in m.attachments
-            ],
-            "reply_to": m.reference.message_id if m.reference else None,
+            "thread_header": thread.name, "id": thread.id,
+            "attachments": [], "content": "", "reply_to": None,
         })
+        messages.extend(thread_messages)
     return messages
 
 
@@ -134,11 +173,20 @@ async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
     marker = re.search(rf"source_channel_id={channel.id}[^\n]*captured_until=(\d+)", page["content"])
     if not marker:
         return False
-    latest = None
+    boundary = int(marker.group(1))
+    # Parent channel must have no messages newer than the capture boundary.
     async for message in channel.history(limit=1, oldest_first=False):
-        latest = message
+        if message.id > boundary:
+            return False
         break
-    return latest is None or latest.id <= int(marker.group(1))
+    # Every thread (active + archived) must also be within the boundary, since
+    # thread conversations are archived by /publish and could otherwise be lost.
+    async for thread in _iter_threads(channel):
+        async for message in thread.history(limit=1, oldest_first=False):
+            if message.id > boundary:
+                return False
+            break
+    return True
 
 @bot.event
 async def on_ready():
@@ -638,25 +686,25 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
         await interaction.followup.send("No matching channels or categories were found. Nothing was deleted.", ephemeral=True)
         return
 
-    # Safety gate: every message-bearing channel must already have a verified
-    # wiki archive before it can be deleted. Voice/stage channels are exempt.
-    try:
-        wiki = await get_wiki_client()
-    except Exception as exc:
-        await interaction.followup.send(
-            f"🛑 Cannot verify wiki archives ({exc}). Deletion blocked for safety.", ephemeral=True)
-        return
-    unarchived = [
-        ch.name for ch in matched_channels
-        if isinstance(ch, (discord.TextChannel, discord.ForumChannel)) and not await is_channel_archived(wiki, ch)
-    ]
-    if unarchived:
-        listing = ", ".join(f"`{n}`" for n in unarchived[:20])
-        more = "" if len(unarchived) <= 20 else f" (+{len(unarchived) - 20} more)"
-        await interaction.followup.send(
-            "🛑 Deletion blocked — these channels have no verified wiki archive yet:\n"
-            f"{listing}{more}\n\nRun `/publish` on each channel first.", ephemeral=True)
-        return
+    # Safety gate: only message-bearing channels (text/forum) need a verified wiki
+    # archive first. Voice/stage/category-only selections skip the wiki entirely, so
+    # they can still be deleted during a wiki outage.
+    to_verify = [ch for ch in matched_channels if isinstance(ch, (discord.TextChannel, discord.ForumChannel))]
+    if to_verify:
+        try:
+            wiki = await get_wiki_client()
+        except Exception as exc:
+            await interaction.followup.send(
+                f"🛑 Cannot verify wiki archives ({exc}). Deletion blocked for safety.", ephemeral=True)
+            return
+        unarchived = [ch.name for ch in to_verify if not await is_channel_archived(wiki, ch)]
+        if unarchived:
+            listing = ", ".join(f"`{n}`" for n in unarchived[:20])
+            more = "" if len(unarchived) <= 20 else f" (+{len(unarchived) - 20} more)"
+            await interaction.followup.send(
+                "🛑 Deletion blocked — these channels have no verified wiki archive yet:\n"
+                f"{listing}{more}\n\nRun `/publish` on each channel first.", ephemeral=True)
+            return
 
     # List categories and explicitly selected standalone channels separately;
     # child channels are represented by the total count to keep the prompt sane.
@@ -841,11 +889,12 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         if other and int(other.group(1)) != channel.id:
             raise WikiError(f"archive page {title!r} belongs to another Discord channel")
     captured_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    real_messages = [m for m in messages if not m.get("thread_header")]
     meta = {
         "channel_id": channel.id,
         "captured_at": captured_at,
-        "captured_until": max((m["id"] for m in messages), default=0),
-        "message_count": len(messages),
+        "captured_until": max((m["id"] for m in real_messages), default=0),
+        "message_count": len(real_messages),
         "complete": all("error" not in att for m in messages for att in m["attachments"]),
     }
     course_match = re.match(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", channel.name.strip(), re.I)
@@ -865,16 +914,25 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
                 if "articleexists" not in str(exc).lower():
                     raise
     if len(parts) > 1:
-        for index, part in enumerate(parts, 1):
-            part_title = f"{title}/Part {index}"
-            part_text = discord_export.render_page(channel.name, part, {**meta, "complete": False})
-            await client.edit_page(part_title, part_text, f"Archive part {index} for #{channel.name}")
-        links = "\n".join(
-            f"* [[{title}/Part {index}|Part {index}]]" for index in range(1, len(parts) + 1)
-        )
-        text = discord_export.render_page(channel.name, [], meta) + f"\n\n== Archive parts ==\n{links}\n"
+        # Map each message id to the part page that holds it, so cross-part reply
+        # links target the correct page instead of a dead same-page anchor.
+        part_titles = [f"{title}/Part {idx}" for idx in range(1, len(parts) + 1)]
+        anchor_index = {m["id"]: part_titles[i] for i, part in enumerate(parts) for m in part}
+        for idx, part in enumerate(parts, 1):
+            part_title = part_titles[idx - 1]
+            part_text = discord_export.render_page(
+                channel.name, part, {**meta, "complete": False},
+                anchor_index=anchor_index, self_title=part_title,
+            )
+            await client.edit_page(part_title, part_text, f"Archive part {idx} for #{channel.name}")
+        links = "\n".join(f"* [[{pt}|Part {i}]]" for i, pt in enumerate(part_titles, 1))
+        # index=True suppresses the "no messages" notice on the canonical index page.
+        text = discord_export.render_page(channel.name, [], meta, index=True) + f"\n\n== Archive parts ==\n{links}\n"
     else:
-        text = discord_export.render_page(channel.name, messages, meta)
+        anchor_index = {m["id"]: title for m in messages}
+        text = discord_export.render_page(
+            channel.name, messages, meta, anchor_index=anchor_index, self_title=title,
+        )
     edit = await client.edit_page(title, text, f"Archive #{channel.name} ({len(messages)} messages)")
     page = await client.get_page(title)
     marker = f"source_channel_id={channel.id}"
@@ -885,7 +943,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     verified = bool(meta["complete"] and page and marker in page["content"] and same_revision)
     return {
         "channel": channel, "ok": verified, "title": title, "url": wiki_page_url(title),
-        "messages": len(messages), "attachments": uploaded,
+        "messages": meta["message_count"], "attachments": uploaded,
         "revid": page["revid"] if page else None,
         "complete": meta["complete"],
     }

@@ -1,9 +1,9 @@
 """Capture a Discord channel and render it as safe MediaWiki wikitext.
 
 Scope (v1, "core" fidelity): author, timestamp, text content (mentions/channels/
-roles/custom-emoji resolved to readable text), attachments, and reply references.
-Reactions, edit history, embeds and thread expansion are intentionally out of
-scope for v1.
+roles/custom-emoji resolved to readable text), attachments, reply references, and
+thread messages (active + archived, rendered as per-thread sections). Reactions,
+edit history and embeds are intentionally out of scope for v1.
 
 Safety: all user-authored text is neutralised so it cannot inject wiki markup
 (templates, links, tables, headings, list markers). Bare URLs are left intact so
@@ -152,13 +152,26 @@ def _format_timestamp(dt) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def render_page(channel_name: str, messages: list, meta: dict) -> str:
+def render_page(
+    channel_name: str,
+    messages: list,
+    meta: dict,
+    *,
+    index: bool = False,
+    anchor_index: dict | None = None,
+    self_title: str | None = None,
+) -> str:
     """Render the full archive page wikitext for a channel.
 
     ``messages`` is an ordered list of dicts (see Archive_Bot.capture_channel);
     each attachment dict may carry ``wiki_filename`` (set after upload) or
     ``error``. ``meta`` supplies header fields (guild, channel_id, captured_at,
     message_count, source).
+
+    ``index`` marks a split archive's index page (suppresses the empty-channel
+    notice). ``anchor_index`` maps a message id to the page title that holds it,
+    and ``self_title`` is this page's title, so cross-part reply links point at
+    the correct part page instead of a dead same-page anchor.
     """
     lines = [
         "{{stub}}" if False else "",
@@ -176,10 +189,15 @@ def render_page(channel_name: str, messages: list, meta: dict) -> str:
         "",
     ]
 
-    if not messages:
+    if not messages and not index:
         lines.append("''No messages were found in this channel.''")
 
     for msg in messages:
+        if msg.get("thread_header"):
+            lines.append("")
+            lines.append(f"=== Thread: {escape_wikitext(msg['thread_header'])} ===")
+            lines.append("")
+            continue
         anchor = f'<span id="msg-{msg["id"]}"></span>'
         author = escape_wikitext(msg.get("author", "unknown"))
         username = msg.get("author_username")
@@ -191,7 +209,13 @@ def render_page(channel_name: str, messages: list, meta: dict) -> str:
         edited = " · edited" if msg.get("edited") else ""
         reply = ""
         if msg.get("reply_to"):
-            reply = f" · &#8618; in reply to [[#msg-{msg['reply_to']}|earlier message]]"
+            rid = msg["reply_to"]
+            target_title = (anchor_index or {}).get(rid)
+            if target_title and self_title and target_title != self_title:
+                link = f"[[{target_title}#msg-{rid}|earlier message]]"
+            else:
+                link = f"[[#msg-{rid}|earlier message]]"
+            reply = f" · &#8618; in reply to {link}"
         header = f"{anchor}\n; {author}{identity} <small>({ts}{edited}){reply}</small>"
         lines.append(header)
 
@@ -221,13 +245,19 @@ def render_page(channel_name: str, messages: list, meta: dict) -> str:
     return "\n".join(lines)
 
 
-def split_messages(messages: list, channel_name: str, meta: dict, max_chars: int = 1_800_000) -> list[list]:
-    """Partition messages so each rendered wikitext page stays below MediaWiki's limit."""
+def split_messages(messages: list, channel_name: str, meta: dict, max_bytes: int = 1_800_000) -> list[list]:
+    """Partition messages so each rendered page stays below MediaWiki's byte limit.
+
+    MediaWiki's article-size limit ($wgMaxArticleSize, default 2 MiB) counts UTF-8
+    bytes, so measure the encoded byte length (multibyte emoji/names count for more
+    than one character).
+    """
     chunks = []
     current = []
     for message in messages:
         candidate = current + [message]
-        if current and len(render_page(channel_name, candidate, {**meta, "complete": False})) > max_chars:
+        rendered = render_page(channel_name, candidate, {**meta, "complete": False})
+        if current and len(rendered.encode("utf-8")) > max_bytes:
             chunks.append(current)
             current = [message]
         else:
