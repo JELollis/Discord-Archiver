@@ -38,13 +38,17 @@ def escape_wikitext(text: str) -> str:
     """Neutralise wiki markup in user text while keeping it readable.
 
     Encodes bracket/brace/pipe characters, escapes runs of apostrophes (bold/
-    italic) and line-leading structural characters. Bare URLs are untouched so
-    they still auto-link.
+    italic), runs of tildes (MediaWiki signature substitution) and line-leading
+    structural characters. Bare URLs are untouched so they still auto-link.
     """
     if not text:
         return ""
     text = "".join(_WIKI_ESCAPE.get(ch, ch) for ch in text)
     text = re.sub(r"'{2,}", lambda m: "&#39;" * len(m.group()), text)
+    # MediaWiki substitutes runs of 3-5 tildes (~~~/~~~~/~~~~~) for the editing
+    # user's signature and/or timestamp during a save; encode them so archived
+    # message text is preserved verbatim instead of being rewritten.
+    text = re.sub(r"~{3,}", lambda m: "&#126;" * len(m.group()), text)
     out = []
     for line in text.split("\n"):
         if line[:1] in _LINE_LEAD:

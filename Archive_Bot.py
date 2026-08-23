@@ -3,6 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import datetime
 import os
+import io
+import zipfile
 import logging
 import urllib.parse
 import re
@@ -91,50 +93,96 @@ def _message_dict(m, guild) -> dict:
 
 
 async def _iter_threads(channel):
-    """Yield a channel's active + archived (public and, if permitted, private) threads, de-duplicated."""
+    """Yield a channel's active + archived (public and private) threads, de-duplicated.
+
+    Raises on any failure to enumerate archived threads (missing permission or a
+    transient Discord API error). Callers MUST treat that failure as "threads
+    could not be fully listed" — never as an empty result — so uncaptured thread
+    history can never be silently excluded from an archive or a deletion check.
+    """
     seen = set()
     for th in list(getattr(channel, "threads", [])):
         if th.id not in seen:
             seen.add(th.id)
             yield th
     for kwargs in ({}, {"private": True}):
-        try:
-            async for th in channel.archived_threads(limit=None, **kwargs):
-                if th.id not in seen:
-                    seen.add(th.id)
-                    yield th
-        except Exception:
-            pass  # missing permission / unsupported channel type -> skip
+        async for th in channel.archived_threads(limit=None, **kwargs):
+            if th.id not in seen:
+                seen.add(th.id)
+                yield th
 
 
-async def capture_channel(channel: discord.TextChannel) -> list:
+def _archive_marker_re(channel_id: int) -> re.Pattern:
+    """Regex matching ONLY the complete bot-generated archive marker comment.
+
+    Anchored on the literal ``<!-- ... -->`` comment that ``render_page`` writes
+    for a finished capture. User-authored message text cannot forge it: angle
+    brackets in message content are HTML-escaped (``&lt;``) before publication,
+    so a message merely quoting ``source_channel_id=...`` never produces a real
+    comment and cannot pass this check. Group 1 is the capture boundary.
+    """
+    return re.compile(
+        rf"<!-- source_channel_id={channel_id} captured_at=[^\n]*? captured_until=(\d+) -->"
+    )
+
+
+async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     """Read a channel's full history AND all its threads (oldest first).
 
-    Returns a flat list; each thread is introduced by a ``{"thread_header": name}``
-    marker entry followed by that thread's messages, so splitting/rendering handle
-    threads uniformly and no thread content is lost before deletion.
+    Returns ``(messages, complete)``. ``messages`` is a flat list; each thread is
+    introduced by a ``{"thread_header": name}`` marker entry followed by that
+    thread's messages, so splitting/rendering handle threads uniformly and no
+    thread content is lost before deletion. ``complete`` is ``False`` when thread
+    enumeration or a per-thread history read failed, so the caller can refuse to
+    mark the archive complete and thereby block deletion of uncaptured history.
     """
     guild = channel.guild
     messages = []
+    complete = True
     async for m in channel.history(limit=None, oldest_first=True):
         messages.append(_message_dict(m, guild))
-    async for thread in _iter_threads(channel):
+    try:
+        threads = [th async for th in _iter_threads(channel)]
+    except Exception as exc:
+        # Could not fully list threads (permission / transient API error). Do not
+        # treat this as "no threads": mark the capture incomplete so deletion of
+        # potentially uncaptured thread history is blocked.
+        logging.warning("Could not enumerate threads in #%s: %s", channel.name, exc)
+        return messages, False
+    for thread in threads:
         thread_messages = []
         try:
             async for m in thread.history(limit=None, oldest_first=True):
                 thread_messages.append(_message_dict(m, guild))
         except Exception as exc:
             logging.warning("Could not read thread '%s' in #%s: %s", getattr(thread, "name", "?"), channel.name, exc)
+            complete = False
         messages.append({
             "thread_header": thread.name, "id": thread.id,
             "attachments": [], "content": "", "reply_to": None,
         })
         messages.extend(thread_messages)
-    return messages
+    return messages, complete
+
+
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # matches $wgMaxUploadSize on the wiki
+
+
+def _zip_bytes(inner_filename: str, data: bytes) -> bytes:
+    """Wrap one file in an in-memory .zip (for types the wiki bans, e.g. .exe/.msi)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(inner_filename, data)
+    return buffer.getvalue()
 
 
 async def archive_attachments(client: MediaWikiClient, channel_name: str, messages: list) -> int:
-    """Upload each attachment to the wiki; annotate dicts with wiki_filename/error."""
+    """Upload each attachment to the wiki; annotate dicts with wiki_filename/error.
+
+    Files whose type the wiki bans (e.g. .exe/.msi installers) are re-uploaded
+    wrapped in a .zip instead of failing, so the content is preserved without
+    weakening MediaWiki's executable-upload protection.
+    """
     uploaded = 0
     for m in messages:
         for att in m["attachments"]:
@@ -143,12 +191,24 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
                 att["error"] = "attachment unavailable"
                 continue
             try:
-                if att.get("size", 0) > 25 * 1024 * 1024:
-                    raise WikiError("attachment exceeds the 25 MiB archive limit")
+                limit_mb = MAX_ATTACHMENT_BYTES // (1024 * 1024)
+                if att.get("size", 0) > MAX_ATTACHMENT_BYTES:
+                    raise WikiError(f"attachment exceeds the {limit_mb} MiB archive limit")
                 data = await obj.read()
                 name = discord_export.attachment_upload_name(channel_name, m["id"], att["id"], att["filename"])
-                result = await client.upload_file(name, data, comment=f"Discord attachment from #{channel_name}")
-                att["wiki_filename"] = result.get("filename") or name
+                try:
+                    result = await client.upload_file(name, data, comment=f"Discord attachment from #{channel_name}")
+                    att["wiki_filename"] = result.get("filename") or name
+                except WikiError as exc:
+                    if "filetype-banned" not in str(exc):
+                        raise
+                    # Wiki disallows this type: preserve it inside a .zip instead.
+                    zip_name = discord_export.sanitize_filename(f"{name}.zip")
+                    result = await client.upload_file(
+                        zip_name, _zip_bytes(att["filename"], data),
+                        comment=f"Discord attachment (zipped) from #{channel_name}")
+                    att["wiki_filename"] = result.get("filename") or zip_name
+                    att["zipped"] = True
                 uploaded += 1
             except Exception as exc:
                 att["error"] = str(exc)
@@ -170,7 +230,7 @@ async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
     page = await client.get_page(title)
     if not page:
         return False
-    marker = re.search(rf"source_channel_id={channel.id}[^\n]*captured_until=(\d+)", page["content"])
+    marker = _archive_marker_re(channel.id).search(page["content"])
     if not marker:
         return False
     boundary = int(marker.group(1))
@@ -181,11 +241,17 @@ async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
         break
     # Every thread (active + archived) must also be within the boundary, since
     # thread conversations are archived by /publish and could otherwise be lost.
-    async for thread in _iter_threads(channel):
-        async for message in thread.history(limit=1, oldest_first=False):
-            if message.id > boundary:
-                return False
-            break
+    # A failure to list or read threads blocks deletion: we cannot prove their
+    # contents are captured.
+    try:
+        async for thread in _iter_threads(channel):
+            async for message in thread.history(limit=1, oldest_first=False):
+                if message.id > boundary:
+                    return False
+                break
+    except Exception as exc:
+        logging.warning("Thread verification failed for #%s; blocking deletion: %s", channel.name, exc)
+        return False
     return True
 
 @bot.event
@@ -574,8 +640,36 @@ class DeleteConfirmationView(discord.ui.View):
         deleted_categories = []
         failures = []
 
+        # Re-verify wiki archives at confirm time. The pre-prompt check ran up to
+        # 60s ago; a member could have posted a new parent message or thread reply
+        # since, making the archive stale. Re-check each message-bearing channel
+        # immediately before deleting it so no uncaptured content is lost.
+        to_verify = [c for c in self.channels if isinstance(c, (discord.TextChannel, discord.ForumChannel))]
+        verify_client = None
+        if to_verify:
+            try:
+                verify_client = await get_wiki_client()
+            except Exception as exc:
+                for child in self.children:
+                    child.disabled = True
+                await interaction.edit_original_response(
+                    content=f"🛑 Cannot re-verify wiki archives ({exc}). Deletion aborted for safety; nothing was deleted.",
+                    view=self,
+                )
+                self.stop()
+                return
+
         # Delete child/standalone channels first, then their categories.
         for channel in self.channels:
+            if verify_client is not None and isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                try:
+                    still_archived = await is_channel_archived(verify_client, channel)
+                except Exception:
+                    still_archived = False
+                if not still_archived:
+                    failures.append(f"channel `{channel.name}`: archive is stale or unverified since confirmation — re-run `/publish` (not deleted)")
+                    logging.warning("Skipped deleting #%s (%s): archive stale/unverified at confirm time.", channel.name, channel.id)
+                    continue
             try:
                 await channel.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
                 deleted_channels.append(channel.name)
@@ -879,7 +973,7 @@ async def help_command(interaction: discord.Interaction, command: app_commands.C
 # ---- publish helper (archive one channel to the wiki, with read-back verification) ----
 async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.TextChannel) -> dict:
     """Capture, upload, render, publish and verify one channel. Returns a result dict."""
-    messages = await capture_channel(channel)
+    messages, capture_complete = await capture_channel(channel)
     uploaded = await archive_attachments(client, channel.name, messages)
     namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
     title = discord_export.make_page_title(channel.name, namespace)
@@ -895,7 +989,9 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "captured_at": captured_at,
         "captured_until": max((m["id"] for m in real_messages), default=0),
         "message_count": len(real_messages),
-        "complete": all("error" not in att for m in messages for att in m["attachments"]),
+        # Incomplete if any attachment failed OR thread enumeration/read failed;
+        # an incomplete archive omits the completion marker and blocks deletion.
+        "complete": capture_complete and all("error" not in att for m in messages for att in m["attachments"]),
     }
     course_match = re.match(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", channel.name.strip(), re.I)
     if course_match:
@@ -935,18 +1031,42 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         )
     edit = await client.edit_page(title, text, f"Archive #{channel.name} ({len(messages)} messages)")
     page = await client.get_page(title)
-    marker = f"source_channel_id={channel.id}"
+    # Verify against the complete bot-generated marker only (not a bare substring
+    # a message could contain), matching the deletion gate in is_channel_archived.
+    marker_present = bool(page and _archive_marker_re(channel.id).search(page["content"]))
     nochange = edit.get("result") == "Nochange" or (
         edit.get("result") == "Success" and "nochange" in edit
     )
     same_revision = bool(nochange or (page and page["revid"] == edit.get("newrevid")))
-    verified = bool(meta["complete"] and page and marker in page["content"] and same_revision)
+    verified = bool(meta["complete"] and marker_present and same_revision)
     return {
         "channel": channel, "ok": verified, "title": title, "url": wiki_page_url(title),
         "messages": meta["message_count"], "attachments": uploaded,
         "revid": page["revid"] if page else None,
         "complete": meta["complete"],
     }
+
+
+async def mark_archive_incomplete(client: MediaWikiClient, title: str, channel_id: int, reason: str) -> None:
+    """Strip the completion marker from a published archive page.
+
+    ``/delete`` gates on the marker written to the canonical wiki page, not on the
+    in-memory publish result. If a post-publication step fails (e.g. the required
+    ``#archives`` announcement never posted), removing the marker here persists
+    that failure into the deletion gate so the channel cannot later be deleted.
+    """
+    try:
+        page = await client.get_page(title)
+        if not page:
+            return
+        new_content, count = _archive_marker_re(channel_id).subn(
+            "<!-- INCOMPLETE: publication not finalised; deletion is blocked. -->",
+            page["content"], count=1,
+        )
+        if count:
+            await client.edit_page(title, new_content, f"Mark archive incomplete: {reason}")
+    except Exception:
+        logging.exception("Failed to mark archive %r incomplete", title)
 
 
 # ---- /publish command (single channel, a whole category, and/or a name list) ----
@@ -966,6 +1086,14 @@ async def publish(
 ):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+    # default_permissions only sets Discord's initial command visibility, which a
+    # guild admin can override or leave stale. Enforce Manage Channels at runtime
+    # before resolving/capturing any target, so an ordinary member cannot use the
+    # free-form channels selector to make the bot read and publish a private
+    # channel they cannot access.
+    if guild is None or not interaction.user.guild_permissions.manage_channels:
+        await interaction.followup.send("You need the Manage Channels permission to use `/publish`.", ephemeral=True)
+        return
 
     # Resolve the target set from any combination of the three inputs.
     targets: list[discord.TextChannel] = []
@@ -1025,9 +1153,11 @@ async def publish(
                 logging.exception("Failed to post archive URL to #archives")
                 result["announcement_error"] = f"could not post the archive URL to #archives: {exc}"
                 result["ok"] = False
+                await mark_archive_incomplete(client, result["title"], ch.id, "#archives announcement failed")
         elif result.get("ok"):
             result["announcement_error"] = "#archives channel was not found"
             result["ok"] = False
+            await mark_archive_incomplete(client, result["title"], ch.id, "#archives channel not found")
 
     ok = [r for r in results if r.get("ok")]
     bad = [r for r in results if not r.get("ok")]
