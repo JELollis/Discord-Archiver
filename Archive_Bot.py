@@ -631,20 +631,25 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
 # ---- Command help registry (drives /help and the admin guide) ----
 COMMAND_HELP = {
     "publish": {
-        "summary": "Archive a Discord text channel to the wiki (capture, upload, publish, verify).",
-        "usage": "/publish [channel:<#channel>]",
+        "summary": "Archive channel(s) to the wiki — a single channel, a whole category, or a name list.",
+        "usage": "/publish [channel:<#channel>] [category:<category>] [channels:<name,name,...>]",
         "params": [
-            "channel — (optional) the text channel to archive; defaults to the channel you run it in.",
+            "channel — (optional) a single text channel.",
+            "category — (optional) archive every text channel in this category.",
+            "channels — (optional) comma-separated channel names to archive.",
+            "With none given, archives the channel you run it in. Inputs combine and de-duplicate.",
         ],
         "examples": [
             "/publish",
             "/publish channel:#cpt-257-summer-2023",
+            "/publish category:Summer 2023 Archive",
+            "/publish channels:cpt-257-summer-2023, ist-201-summer-2023",
         ],
         "notes": (
-            "Reads the channel's full history, uploads its attachments to the wiki, renders a page at "
-            "Archive:YYYY/Term/DEPT-NUM (or Archive:Misc/<name> for non-course channels), then reads the page "
-            "back to verify it saved. On success it posts the wiki URL to #archives and the channel becomes "
-            "eligible for /delete. Requires Manage Channels."
+            "For each channel: reads full history, uploads attachments, renders a page at "
+            "Archive:YYYY/Term/DEPT-NUM (or Archive:Misc/<name>), then reads it back to verify. Verified pages "
+            "post to #archives and become eligible for /delete; failures are listed and are NOT marked deletable. "
+            "Results post to #archives as each finishes. Requires Manage Channels."
         ),
     },
     "delete": {
@@ -767,65 +772,113 @@ async def help_command(interaction: discord.Interaction, command: app_commands.C
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-# ---- /publish command (archive a channel to the wiki with verification) ----
-@tree.command(name="publish", description="Archive a Discord channel to the wiki (capture, upload, publish, verify).")
-@app_commands.describe(channel="Channel to archive (defaults to the current channel)")
+# ---- publish helper (archive one channel to the wiki, with read-back verification) ----
+async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.TextChannel) -> dict:
+    """Capture, upload, render, publish and verify one channel. Returns a result dict."""
+    messages = await capture_channel(channel)
+    uploaded = await archive_attachments(client, channel.name, messages)
+    namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+    title = discord_export.make_page_title(channel.name, namespace)
+    captured_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    meta = {"channel_id": channel.id, "captured_at": captured_at, "message_count": len(messages)}
+    text = discord_export.render_page(channel.name, messages, meta)
+    edit = await client.edit_page(title, text, f"Archive #{channel.name} ({len(messages)} messages)")
+    page = await client.get_page(title)
+    marker = f"source_channel_id={channel.id}"
+    verified = bool(page and marker in page["content"] and page["revid"] == edit.get("newrevid"))
+    return {
+        "channel": channel, "ok": verified, "title": title, "url": wiki_page_url(title),
+        "messages": len(messages), "attachments": uploaded,
+        "revid": page["revid"] if page else None,
+    }
+
+
+# ---- /publish command (single channel, a whole category, and/or a name list) ----
+@tree.command(name="publish", description="Archive channel(s) to the wiki: a channel, a category, or a name list.")
+@app_commands.describe(
+    channel="A single text channel to archive",
+    category="Archive every text channel in this category",
+    channels="Comma-separated channel names to archive",
+)
 @app_commands.default_permissions(manage_channels=True)
 @app_commands.guild_only()
-async def publish(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+async def publish(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+    category: discord.CategoryChannel | None = None,
+    channels: str | None = None,
+):
     await interaction.response.defer(ephemeral=True)
-    channel = channel or interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.followup.send("Please choose a text channel to archive.", ephemeral=True)
+    guild = interaction.guild
+
+    # Resolve the target set from any combination of the three inputs.
+    targets: list[discord.TextChannel] = []
+    if channel is not None:
+        targets.append(channel)
+    if category is not None:
+        targets.extend(c for c in category.text_channels)
+    if channels:
+        wanted = {n.strip().lstrip("#").casefold() for n in channels.split(",") if n.strip()}
+        found = {c.name.casefold() for c in guild.text_channels}
+        targets.extend(c for c in guild.text_channels if c.name.casefold() in wanted)
+        missing = [n for n in wanted if n not in found]
+        if missing:
+            await interaction.followup.send(
+                "⚠️ Not found: " + ", ".join(f"`{n}`" for n in sorted(missing)), ephemeral=True)
+    if not targets and isinstance(interaction.channel, discord.TextChannel):
+        targets.append(interaction.channel)  # default: the current channel
+
+    # De-duplicate, preserving order.
+    seen: set[int] = set()
+    targets = [t for t in targets if not (t.id in seen or seen.add(t.id))]
+    if not targets:
+        await interaction.followup.send("No text channels to publish.", ephemeral=True)
         return
+
     try:
         client = await get_wiki_client()
-        await interaction.followup.send(f"⏳ Capturing #{channel.name} …", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Wiki unavailable: {exc}", ephemeral=True)
+        return
 
-        messages = await capture_channel(channel)
-        uploaded = await archive_attachments(client, channel.name, messages)
+    await interaction.followup.send(
+        f"⏳ Publishing {len(targets)} channel(s)… results will post to #archives as they finish.",
+        ephemeral=True,
+    )
+    archives_channel = discord.utils.get(guild.text_channels, name="archives")
 
-        namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
-        title = discord_export.make_page_title(channel.name, namespace)
-        captured_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        meta = {"channel_id": channel.id, "captured_at": captured_at, "message_count": len(messages)}
-        text = discord_export.render_page(channel.name, messages, meta)
-
-        edit = await client.edit_page(title, text, f"Archive #{channel.name} ({len(messages)} messages)")
-
-        # Read-back verification: page exists, carries our source marker, latest revid matches.
-        page = await client.get_page(title)
-        marker = f"source_channel_id={channel.id}"
-        verified = bool(page and marker in page["content"] and page["revid"] == edit.get("newrevid"))
-        url = wiki_page_url(title)
-
-        if not verified:
-            logging.error("Publish verification FAILED for %s (channel %s)", title, channel.id)
-            await interaction.followup.send(
-                f"⚠️ Published `{title}` but **read-back verification FAILED** — do NOT delete the channel. "
-                f"Check the wiki: <{url}>",
-                ephemeral=True,
-            )
-            return
-
-        archives_channel = discord.utils.get(channel.guild.text_channels, name="archives")
-        if archives_channel is not None:
+    results = []
+    for ch in targets:
+        try:
+            result = await publish_channel_to_wiki(client, ch)
+        except Exception as exc:
+            logging.exception("publish failed for #%s", ch.name)
+            result = {"channel": ch, "ok": False, "error": str(exc)}
+        results.append(result)
+        if result.get("ok") and archives_channel is not None:
             try:
                 await archives_channel.send(
-                    f"📚 Archived **#{channel.name}** — {len(messages)} messages, {uploaded} attachment(s): {url}"
+                    f"📚 Archived **#{ch.name}** — {result['messages']} messages, "
+                    f"{result['attachments']} attachment(s): {result['url']}"
                 )
             except Exception:
                 logging.exception("Failed to post archive URL to #archives")
 
-        await interaction.followup.send(
-            f"✅ Archived **#{channel.name}** → <{url}>\n"
-            f"{len(messages)} messages, {uploaded} attachment(s), verified (revid {page['revid']}).\n"
-            f"This channel is now cleared for `/delete`.",
-            ephemeral=True,
-        )
-    except Exception as exc:
-        logging.exception("publish failed")
-        await interaction.followup.send(f"❌ Publish failed: {exc}", ephemeral=True)
+    ok = [r for r in results if r.get("ok")]
+    bad = [r for r in results if not r.get("ok")]
+    lines = [f"✅ Published and verified {len(ok)}/{len(results)} channel(s)."]
+    for r in ok[:12]:
+        lines.append(f"• #{r['channel'].name} → <{r['url']}> ({r['messages']} msgs)")
+    if len(ok) > 12:
+        lines.append(f"• …and {len(ok) - 12} more (see #archives)")
+    if bad:
+        lines.append(f"⚠️ **Failed/unverified ({len(bad)}) — do NOT delete these:**")
+        for r in bad[:12]:
+            lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
+    try:
+        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+    except Exception:
+        logging.exception("Failed to send publish summary (interaction may have expired)")
 
 
 # ---- /wiki_status command (verify archive wiki connectivity) ----

@@ -28,22 +28,34 @@ flow is:
 
 ## Wiki archiving commands
 
-### `/publish` — archive a channel to the wiki
-Captures a text channel's full history, uploads its attachments, publishes a wiki page, and verifies it.
+### `/publish` — archive channel(s) to the wiki
+Captures each channel's full history, uploads its attachments, publishes a wiki page, and verifies it.
+Can do a single channel, an **entire category**, or a **list** of channels in one run.
 
-- **Usage:** `/publish [channel:#channel]`
-- **Parameters:**
-  - `channel` *(optional)* — the text channel to archive. Defaults to the channel you run the command in.
+- **Usage:** `/publish [channel:#channel] [category:<category>] [channels:<name,name,...>]`
+- **Parameters** *(all optional; they combine and de-duplicate)*:
+  - `channel` — a single text channel.
+  - `category` — archive **every text channel in this category** (great for end-of-term).
+  - `channels` — comma-separated channel names.
+  - With none given, it archives the channel you run the command in.
 - **Examples:**
   - `/publish`
   - `/publish channel:#cpt-257-summer-2023`
-- **What it does:** reads every message (author, timestamp, text, attachments, reply references),
-  uploads attachments to the wiki, and creates a page at **`Archive:YYYY/Term/DEPT-NUM`**
-  (e.g. `Archive:2023/Summer/CPT-257`). Channels that don't match the `dept-num-term-year` naming go to
-  **`Archive:Misc/<name>`**. The bot then **reads the page back to verify** it saved, posts the link in
-  **#archives**, and marks the channel as safe to delete.
-- **If verification fails:** the bot tells you and does **not** mark the channel deletable — do not delete it; re-run `/publish`.
+  - `/publish category:Summer 2023 Archive`  ← archives the whole category
+  - `/publish channels:cpt-257-summer-2023, ist-201-summer-2023`
+- **What it does (per channel):** reads every message (author, timestamp, text, attachments, reply
+  references), uploads attachments, and creates a page at **`Archive:YYYY/Term/DEPT-NUM`**
+  (e.g. `Archive:2023/Summer/CPT-257`); non-course names go to **`Archive:Misc/<name>`**. It then
+  **reads the page back to verify** it saved. Verified pages are linked in **#archives** and become
+  eligible for `/delete`.
+- **Batch behaviour:** channels are processed one after another; each verified archive posts to **#archives**
+  as it finishes, and you get a final summary listing successes and any failures.
+- **If a channel fails/verification fails:** it is listed as failed and is **not** marked deletable — re-run
+  `/publish` for it; do not delete it.
 - **Permission:** Manage Channels.
+
+> **Tip — end-of-term:** `/publish category:Summer 2023 Archive` to archive the whole term, confirm the
+> links in #archives, then `/delete target_type:Category targets:Summer 2023 Archive`.
 
 ### `/wiki_status` — check the wiki connection
 Confirms the bot can reach the wiki and has the rights it needs.

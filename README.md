@@ -56,7 +56,7 @@ Admin (Discord)                         Members (browser / mobile)
 
 | Command | What it does |
 |---|---|
-| `/publish [channel]` | Archive a text channel to the wiki (capture → upload → publish → verify → post link). |
+| `/publish [channel] [category] [channels]` | Archive a channel, a whole category, or a list of channels to the wiki (capture → upload → publish → verify → post link). |
 | `/wiki_status` | Check the wiki connection and the bot's wiki permissions. |
 | `/delete target_type targets` | Permanently delete channels/categories (confirmation + requires a verified archive). |
 | `/archive term year` | Move a term's channels into a read-only Discord archive category. |
