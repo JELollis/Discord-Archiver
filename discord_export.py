@@ -147,7 +147,8 @@ def _render_attachment(att: dict) -> str:
     ext = wiki_name.rsplit(".", 1)[-1].lower() if "." in wiki_name else ""
     if ext in _IMAGE_EXT:
         return f"[[File:{wiki_name}|thumb|none|400px|{original}]]"
-    return f"&#128206; [[Media:{wiki_name}|{original}]]"
+    suffix = " ''(zipped)''" if att.get("zipped") else ""
+    return f"&#128206; [[Media:{wiki_name}|{original}]]{suffix}"
 
 
 def _format_timestamp(dt) -> str:
