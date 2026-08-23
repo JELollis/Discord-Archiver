@@ -51,7 +51,11 @@ async def get_wiki_client() -> MediaWikiClient:
         raise WikiError(WIKI_CONFIG_ERROR or "MediaWiki is not configured on this host.")
     if _wiki_client is None:
         client = MediaWikiClient.from_config(WIKI_CONFIG)
-        await client.login()
+        try:
+            await client.login()
+        except Exception:
+            await client.close()
+            raise
         _wiki_client = client
     return _wiki_client
 
@@ -203,9 +207,14 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
                 for target in list(channel.overwrites.keys()):
                     await channel.set_permissions(target, overwrite=None)
 
-                # Apply archive-specific permissions
+                # Apply archive-specific permissions. Keep the bot able to
+                # read the channel even when it is not assigned Verified.
                 await channel.set_permissions(guild.default_role, read_messages=False, send_messages=False)
                 await channel.set_permissions(verified_role, read_messages=True, send_messages=False, read_message_history=True)
+                if guild.me is not None:
+                    await channel.set_permissions(
+                        guild.me, read_messages=True, read_message_history=True, send_messages=False
+                    )
                 moved_channels.append(channel.name)
                 logging.info("Channel '%s' moved to archive and permissions updated.", channel.name)
 
@@ -629,8 +638,8 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
         await interaction.followup.send("No matching channels or categories were found. Nothing was deleted.", ephemeral=True)
         return
 
-    # Safety gate (Auth_plan): every selected TEXT channel must already have a
-    # verified wiki archive before it can be deleted. Non-text channels are exempt.
+    # Safety gate: every message-bearing channel must already have a verified
+    # wiki archive before it can be deleted. Voice/stage channels are exempt.
     try:
         wiki = await get_wiki_client()
     except Exception as exc:
@@ -639,7 +648,7 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
         return
     unarchived = [
         ch.name for ch in matched_channels
-        if isinstance(ch, discord.TextChannel) and not await is_channel_archived(wiki, ch)
+        if isinstance(ch, (discord.TextChannel, discord.ForumChannel)) and not await is_channel_archived(wiki, ch)
     ]
     if unarchived:
         listing = ", ".join(f"`{n}`" for n in unarchived[:20])
@@ -869,7 +878,10 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     edit = await client.edit_page(title, text, f"Archive #{channel.name} ({len(messages)} messages)")
     page = await client.get_page(title)
     marker = f"source_channel_id={channel.id}"
-    same_revision = edit.get("result") == "Nochange" or (page and page["revid"] == edit.get("newrevid"))
+    nochange = edit.get("result") == "Nochange" or (
+        edit.get("result") == "Success" and "nochange" in edit
+    )
+    same_revision = bool(nochange or (page and page["revid"] == edit.get("newrevid")))
     verified = bool(meta["complete"] and page and marker in page["content"] and same_revision)
     return {
         "channel": channel, "ok": verified, "title": title, "url": wiki_page_url(title),
@@ -899,6 +911,7 @@ async def publish(
 
     # Resolve the target set from any combination of the three inputs.
     targets: list[discord.TextChannel] = []
+    selector_supplied = channel is not None or category is not None or bool(channels and channels.strip())
     if channel is not None:
         targets.append(channel)
     if category is not None:
@@ -914,7 +927,7 @@ async def publish(
         if not targets:
             await interaction.followup.send("No supplied channel names matched; nothing was published.", ephemeral=True)
             return
-    if not targets and isinstance(interaction.channel, discord.TextChannel):
+    if not targets and not selector_supplied and isinstance(interaction.channel, discord.TextChannel):
         targets.append(interaction.channel)  # default: the current channel
 
     # De-duplicate, preserving order.
@@ -950,11 +963,13 @@ async def publish(
                     f"📚 Archived **#{ch.name}** — {result['messages']} messages, "
                     f"{result['attachments']} attachment(s): {result['url']}"
                 )
-            except Exception:
+            except Exception as exc:
                 logging.exception("Failed to post archive URL to #archives")
-                result["announcement_error"] = "could not post the archive URL to #archives"
+                result["announcement_error"] = f"could not post the archive URL to #archives: {exc}"
+                result["ok"] = False
         elif result.get("ok"):
             result["announcement_error"] = "#archives channel was not found"
+            result["ok"] = False
 
     ok = [r for r in results if r.get("ok")]
     bad = [r for r in results if not r.get("ok")]
@@ -970,9 +985,23 @@ async def publish(
         for r in bad[:12]:
             lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
         if len(bad) > 12:
-            lines.append(f"• …and {len(bad) - 12} more failures; inspect the bot log and republish them.")
+            lines.append(f"• Additional failures ({len(bad) - 12}):")
+            for r in bad[12:]:
+                lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
     try:
-        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+        # Discord limits a message to 2000 characters; paginate rather than
+        # silently dropping failure names after the first chunk.
+        chunks = []
+        current = ""
+        for line in lines:
+            if current and len(current) + len(line) + 1 > 1900:
+                chunks.append(current)
+                current = ""
+            current = f"{current}\n{line}".strip() if current else line
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
     except Exception:
         logging.exception("Failed to send publish summary (interaction may have expired)")
 

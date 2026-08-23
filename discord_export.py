@@ -101,7 +101,13 @@ def sanitize_filename(name: str) -> str:
     name = name.replace(" ", "_")
     name = re.sub(r"[#<>\[\]|{}:/]+", "-", name)
     name = re.sub(r"-{2,}", "-", name).strip("-._") or "file"
-    return name[:200]
+    if len(name) <= 200:
+        return name
+    stem, dot, extension = name.rpartition(".")
+    if not dot or not extension:
+        return name[:200]
+    suffix = f".{extension}"
+    return f"{stem[:200 - len(suffix)]}{suffix}"
 
 
 _CHANNEL_PATTERN = re.compile(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", re.IGNORECASE)

@@ -243,9 +243,11 @@ class MediaWikiClient:
                 # and usable. Treat this as an idempotent success.
                 if error.get("code") == "fileexists-no-change":
                     return {
-                        "result": "Success",
-                        "filename": filename,
-                        "duplicate": True,
+                        "upload": {
+                            "result": "Success",
+                            "filename": filename,
+                            "duplicate": True,
+                        }
                     }
                 raise WikiError(f"upload {filename!r} failed: {result['error']}")
             return result
