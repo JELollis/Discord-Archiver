@@ -1,0 +1,3 @@
+# Discord Archiver bot dependencies
+# discord.py bundles aiohttp (used by wiki_client.py for the MediaWiki API).
+discord.py>=2.5,<3
