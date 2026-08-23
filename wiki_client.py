@@ -61,7 +61,8 @@ def load_config(env: Optional[dict] = None) -> dict:
                 break
 
     config = {k: values.get(k) for k in keys}
-    config.setdefault("MEDIAWIKI_ARCHIVE_NAMESPACE", "Archive")
+    if not config.get("MEDIAWIKI_ARCHIVE_NAMESPACE"):
+        config["MEDIAWIKI_ARCHIVE_NAMESPACE"] = "Archive"
     missing = [k for k in keys if not config.get(k)]
     if missing:
         raise WikiError(f"Missing MediaWiki configuration: {', '.join(missing)}")
@@ -158,8 +159,20 @@ class MediaWikiClient:
         return result
 
     async def _ensure_csrf(self) -> None:
-        if not self._csrf:
+        if not self._csrf or not self.logged_in:
             await self.login()
+
+    async def _retry_after_auth_error(self, operation):
+        """Retry one mutation after clearing stale login/CSRF state."""
+        try:
+            return await operation()
+        except WikiError as exc:
+            if "badtoken" not in str(exc).lower() and "not logged in" not in str(exc).lower():
+                raise
+            self._csrf = None
+            self.logged_in = False
+            await self.login()
+            return await operation()
 
     async def userinfo(self) -> dict:
         return (await self._get({
@@ -193,10 +206,13 @@ class MediaWikiClient:
             data["bot"] = "1"
         if createonly:
             data["createonly"] = "1"
-        result = await self._post(data)
-        if "error" in result:
-            raise WikiError(f"edit {title!r} failed: {result['error']}")
-        return result["edit"]
+        async def submit():
+            data["token"] = self._csrf
+            result = await self._post(data)
+            if "error" in result:
+                raise WikiError(f"edit {title!r} failed: {result['error']}")
+            return result
+        return (await self._retry_after_auth_error(submit))["edit"]
 
     async def upload_file(
         self,
@@ -217,10 +233,13 @@ class MediaWikiClient:
         if ignorewarnings:
             data["ignorewarnings"] = "1"
         files = {"file": (filename, content, "application/octet-stream")}
-        result = await self._post(data, files=files)
-        if "error" in result:
-            raise WikiError(f"upload {filename!r} failed: {result['error']}")
-        return result["upload"]
+        async def submit():
+            data["token"] = self._csrf
+            result = await self._post(data, files=files)
+            if "error" in result:
+                raise WikiError(f"upload {filename!r} failed: {result['error']}")
+            return result
+        return (await self._retry_after_auth_error(submit))["upload"]
 
     async def get_page(self, title: str) -> Optional[dict]:
         """Return {pageid, revid, content} for the latest revision, or None."""

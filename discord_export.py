@@ -27,6 +27,8 @@ _WIKI_ESCAPE = {
     "[": "&#91;", "]": "&#93;",
     "{": "&#123;", "}": "&#125;",
     "|": "&#124;",
+    "<": "&lt;",
+    ">": "&gt;",
 }
 # Characters that start structural wikitext when they lead a line.
 _LINE_LEAD = set("*#:;=! ")
@@ -51,7 +53,7 @@ def escape_wikitext(text: str) -> str:
     return "\n".join(out)
 
 
-def resolve_mentions(text: str, guild) -> str:
+def resolve_mentions(text: str, guild, *, members=None, channels=None, roles=None) -> str:
     """Replace Discord <@id>/<#id>/<@&id>/<:emoji:id> tokens with readable text.
 
     Runs BEFORE escaping; the resolved names are escaped by the caller.
@@ -60,15 +62,21 @@ def resolve_mentions(text: str, guild) -> str:
         return ""
 
     def user_repl(m):
-        member = guild.get_member(int(m.group(1))) if guild else None
+        member = (members or {}).get(int(m.group(1)))
+        if member is None and guild:
+            member = guild.get_member(int(m.group(1)))
         return f"@{member.display_name}" if member else "@unknown-user"
 
     def channel_repl(m):
-        chan = guild.get_channel(int(m.group(1))) if guild else None
+        chan = (channels or {}).get(int(m.group(1)))
+        if chan is None and guild:
+            chan = guild.get_channel(int(m.group(1)))
         return f"#{chan.name}" if chan else "#unknown-channel"
 
     def role_repl(m):
-        role = guild.get_role(int(m.group(1))) if guild else None
+        role = (roles or {}).get(int(m.group(1)))
+        if role is None and guild:
+            role = guild.get_role(int(m.group(1)))
         return f"@{role.name}" if role else "@unknown-role"
 
     text = _RE_USER.sub(user_repl, text)
@@ -102,19 +110,19 @@ _CHANNEL_PATTERN = re.compile(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", 
 def make_page_title(channel_name: str, namespace: str = "Archive") -> str:
     """Map a Discord channel name to an archive page title.
 
-    ``cpt-257-summer-2023`` -> ``Archive:2023/Summer/CPT-257``. Channels that do
+    ``cpt-257-summer-2023`` -> ``Archive:CPT-257/Summer 2023``. Channels that do
     not match the DEPT-NUM-TERM-YEAR pattern land under ``Archive:Misc/<name>``.
     """
     m = _CHANNEL_PATTERN.match(channel_name.strip())
     if m:
         dept, num, term, year = m.groups()
-        return f"{namespace}:{year}/{term.capitalize()}/{dept.upper()}-{num}"
+        return f"{namespace}:{dept.upper()}-{num}/{term.capitalize()} {year}"
     return f"{namespace}:Misc/{sanitize_title_part(channel_name)}"
 
 
-def attachment_upload_name(channel_name: str, message_id: int, filename: str) -> str:
+def attachment_upload_name(channel_name: str, message_id: int, attachment_id: int, filename: str) -> str:
     """Deterministic, collision-resistant upload filename for an attachment."""
-    return sanitize_filename(f"{channel_name}-{message_id}-{filename}")
+    return sanitize_filename(f"{channel_name}-{message_id}-{attachment_id}-{filename}")
 
 
 _IMAGE_EXT = {"png", "gif", "jpg", "jpeg", "webp"}
@@ -168,12 +176,17 @@ def render_page(channel_name: str, messages: list, meta: dict) -> str:
     for msg in messages:
         anchor = f'<span id="msg-{msg["id"]}"></span>'
         author = escape_wikitext(msg.get("author", "unknown"))
+        username = msg.get("author_username")
+        author_id = msg.get("author_id")
+        identity = f" (@{escape_wikitext(username)})" if username and username != msg.get("author") else ""
+        if author_id:
+            identity += f" [Discord ID: {author_id}]"
         ts = _format_timestamp(msg.get("created"))
         edited = " · edited" if msg.get("edited") else ""
         reply = ""
         if msg.get("reply_to"):
             reply = f" · &#8618; in reply to [[#msg-{msg['reply_to']}|earlier message]]"
-        header = f"{anchor}\n; {author} <small>({ts}{edited}){reply}</small>"
+        header = f"{anchor}\n; {author}{identity} <small>({ts}{edited}){reply}</small>"
         lines.append(header)
 
         content = msg.get("content") or ""
@@ -189,8 +202,30 @@ def render_page(channel_name: str, messages: list, meta: dict) -> str:
         lines.append("")
 
     lines.append("")
-    lines.append(
-        f"[[Category:Discord archive]] "
-        f"<!-- source_channel_id={meta.get('channel_id')} captured_at={meta.get('captured_at')} -->"
-    )
+    lines.append("[[Category:Discord archive]]")
+    if meta.get("category"):
+        lines.append(f"[[Category:{escape_wikitext(meta['category'])}]]")
+    if meta.get("complete", True):
+        lines.append(
+            f"<!-- source_channel_id={meta.get('channel_id')} captured_at={meta.get('captured_at')} "
+            f"captured_until={meta.get('captured_until')} -->"
+        )
+    else:
+        lines.append("<!-- INCOMPLETE: attachment or capture errors; deletion is blocked. -->")
     return "\n".join(lines)
+
+
+def split_messages(messages: list, channel_name: str, meta: dict, max_chars: int = 1_800_000) -> list[list]:
+    """Partition messages so each rendered wikitext page stays below MediaWiki's limit."""
+    chunks = []
+    current = []
+    for message in messages:
+        candidate = current + [message]
+        if current and len(render_page(channel_name, candidate, {**meta, "complete": False})) > max_chars:
+            chunks.append(current)
+            current = [message]
+        else:
+            current = candidate
+    if current or not chunks:
+        chunks.append(current)
+    return chunks

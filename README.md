@@ -18,7 +18,7 @@ The bot captures a channel's full history, uploads its attachments, publishes a 
   verification and a link posted to `#archives`.
 - **Guarded deletion** — a text channel can only be deleted after it has a verified wiki archive.
 - **Private wiki with Discord SSO** — the wiki is readable only by verified members, logging in with
-  Discord via Authentik (OpenID Connect). See [`Auth_plan.md`](Auth_plan.md) and [`setup.md`](setup.md).
+  Discord via Authentik (OpenID Connect).
 
 ## Architecture
 
@@ -35,8 +35,7 @@ Admin (Discord)                         Members (browser / mobile)
 - **Bot → MediaWiki:** the bot publishes via the MediaWiki API using a scoped **BotPassword**.
 - **Members → MediaWiki:** browser login is Discord → Authentik (OIDC) → MediaWiki; guild membership is
   required and Discord roles map to wiki groups (member / editor / sysop).
-- Full deployment of the wiki, identity provider, database, and high-availability layout is documented
-  in [`setup.md`](setup.md); the design rationale is in [`Auth_plan.md`](Auth_plan.md).
+- The deployment details are kept in private operator documentation and are intentionally not included here.
 
 ## Repository layout
 
@@ -47,10 +46,6 @@ Admin (Discord)                         Members (browser / mobile)
 | `discord_export.py` | Renders a captured channel into safe MediaWiki wikitext (mention resolution, escaping, page-title mapping). |
 | `Archive_Bot2.py` | Previous bot version, kept for reference/rollback. |
 | `archive.py`, `roles_generator.py`, `quick_update.py` | Older/utility scripts. |
-| `ADMIN_GUIDE.md` | **Full command reference for admins**, with examples. |
-| `ArchiveBot_Admin_Instructions.md` | Legacy operator notes (term-specific examples). |
-| `setup.md` | Step-by-step deployment of the wiki + Authentik + databases. |
-| `Auth_plan.md` | Authentication/architecture design. |
 
 ## Commands (summary)
 
@@ -64,12 +59,12 @@ Admin (Discord)                         Members (browser / mobile)
 | `/add_role category courses` | Create/update course roles with the standard permission set. |
 | `/help [command]` | List commands, or show full help for one. |
 
-See **[`ADMIN_GUIDE.md`](ADMIN_GUIDE.md)** for detailed usage, parameters, examples, and the end-of-term workflow.
+Command parameters and safety behavior are also available through the bot's `/help` command.
 
 ## Wiki page structure
 
-Course channels map to `Archive:YYYY/Term/DEPT-NUM` (e.g. `cpt-257-summer-2023` →
-`Archive:2023/Summer/CPT-257`). Channels that don't match the `dept-num-term-year` pattern are archived
+Course channels map to `Archive:DEPT-NUM/Term Year` (e.g. `cpt-257-summer-2023` →
+`Archive:CPT-257/Summer 2023`). Channels that don't match the `dept-num-term-year` pattern are archived
 under `Archive:Misc/<name>`. Each message gets a stable anchor so links can target a specific message.
 
 ## Configuration
@@ -107,9 +102,8 @@ Run the bot:
 venv/bin/python Archive_Bot.py
 ```
 
-In production it runs as a `systemd` service (`discord-archiver.service`) as an unprivileged user, with the
-working directory set to the bot folder so it finds `Bot Key.txt`. The wiki, identity provider, and
-databases are deployed separately per [`setup.md`](setup.md).
+In production it runs as a `systemd` service (`discord-archiver.service`) as an unprivileged user. The wiki,
+identity provider, and databases are deployed separately using private operator documentation.
 
 The wiki requires MediaWiki **1.43 LTS** with the **PluggableAuth** and **OpenID Connect** extensions, an
 `Archive` namespace, and uploads enabled.
