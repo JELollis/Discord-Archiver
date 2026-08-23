@@ -237,6 +237,16 @@ class MediaWikiClient:
             data["token"] = self._csrf
             result = await self._post(data, files=files)
             if "error" in result:
+                error = result["error"]
+                # MediaWiki reports an exact duplicate as an error-shaped
+                # response even though the requested file is already present
+                # and usable. Treat this as an idempotent success.
+                if error.get("code") == "fileexists-no-change":
+                    return {
+                        "result": "Success",
+                        "filename": filename,
+                        "duplicate": True,
+                    }
                 raise WikiError(f"upload {filename!r} failed: {result['error']}")
             return result
         return (await self._retry_after_auth_error(submit))["upload"]
