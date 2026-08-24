@@ -1091,10 +1091,13 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
             await interaction.followup.send(
                 f"🛑 Cannot verify wiki archives ({exc}). Deletion blocked for safety.", ephemeral=True)
             return
-        unarchived.extend(
-            ch for ch in wiki_targets
-            if not await is_channel_archived(wiki, ch)
-        )
+        # A generator expression containing ``await`` is an async generator,
+        # which ``list.extend`` cannot consume.  Verify sequentially so the
+        # MediaWiki client is not used concurrently and append failures
+        # explicitly.
+        for ch in wiki_targets:
+            if not await is_channel_archived(wiki, ch):
+                unarchived.append(ch)
     if unarchived:
         listing = ", ".join(f"`{ch.name}`" for ch in unarchived[:20])
         more = "" if len(unarchived) <= 20 else f" (+{len(unarchived) - 20} more)"
