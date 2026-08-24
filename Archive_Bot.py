@@ -122,8 +122,28 @@ def _archive_marker_re(channel_id: int) -> re.Pattern:
     comment and cannot pass this check. Group 1 is the capture boundary.
     """
     return re.compile(
-        rf"<!-- source_channel_id={channel_id} captured_at=[^\n]*? captured_until=(\d+) -->"
+        rf"<!-- source_channel_id={channel_id} captured_at=([^\n]*?) captured_until=(\d+) -->"
     )
+
+
+def _is_locked_readonly(channel) -> bool:
+    """True if no member (other than the bot) can post in this channel.
+
+    Matches the state `/archive` leaves: `@everyone` denied `send_messages` and no
+    permission overwrite granting `send_messages` to anyone but the bot. Requiring
+    this before publish/delete guarantees the channel is frozen, so its archive
+    cannot go stale between capture and deletion (the archive→publish→delete flow).
+    """
+    guild = channel.guild
+    default = channel.overwrites_for(guild.default_role)
+    if default.send_messages is not False:
+        return False
+    for target, overwrite in channel.overwrites.items():
+        if guild.me is not None and target == guild.me:
+            continue
+        if overwrite.send_messages:  # explicitly allowed to send
+            return False
+    return True
 
 
 # Ownership marker with the channel id as a capture group, for reading which
@@ -241,24 +261,43 @@ async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
     marker = _archive_marker_re(channel.id).search(page["content"])
     if not marker:
         return False
-    boundary = int(marker.group(1))
-    # Parent channel must have no messages newer than the capture boundary.
-    async for message in channel.history(limit=1, oldest_first=False):
-        if message.id > boundary:
-            return False
-        break
-    # Every thread (active + archived) must also be within the boundary, since
-    # thread conversations are archived by /publish and could otherwise be lost.
-    # A failure to list or read threads blocks deletion: we cannot prove their
-    # contents are captured.
+    boundary = int(marker.group(2))
     try:
-        async for thread in _iter_threads(channel):
-            async for message in thread.history(limit=1, oldest_first=False):
+        capture_dt = datetime.datetime.strptime(marker.group(1), "%Y-%m-%d %H:%M UTC").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        logging.warning("Unparseable captured_at for #%s; blocking deletion.", channel.name)
+        return False
+    # The channel must be frozen (read-only) now. A writable channel could have
+    # received new messages after capture whose IDs fall below the global boundary
+    # (parent messages hidden behind a later thread snowflake), so only a locked
+    # channel makes the archive provably current.
+    if not _is_locked_readonly(channel):
+        return False
+
+    def _stream_current(messages_iter):
+        # Every message must be within the ID boundary (no new posts) AND not edited
+        # after capture (a locked channel can still be edited by its author).
+        async def check():
+            async for message in messages_iter:
                 if message.id > boundary:
                     return False
-                break
+                edited = getattr(message, "edited_at", None)
+                if edited is not None and edited > capture_dt:
+                    return False
+            return True
+        return check()
+
+    try:
+        if not await _stream_current(channel.history(limit=None, oldest_first=False)):
+            return False
+        # Every thread (active + archived) must also be captured and unedited; a
+        # failure to list or read threads blocks deletion (contents unprovable).
+        async for thread in _iter_threads(channel):
+            if not await _stream_current(thread.history(limit=None, oldest_first=False)):
+                return False
     except Exception as exc:
-        logging.warning("Thread verification failed for #%s; blocking deletion: %s", channel.name, exc)
+        logging.warning("Content verification failed for #%s; blocking deletion: %s", channel.name, exc)
         return False
     return True
 
@@ -994,6 +1033,11 @@ async def help_command(interaction: discord.Interaction, command: app_commands.C
 # ---- publish helper (archive one channel to the wiki, with read-back verification) ----
 async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.TextChannel) -> dict:
     """Capture, upload, render, publish and verify one channel. Returns a result dict."""
+    # Only capture a frozen channel. Publishing a still-writable channel is racy:
+    # a message posted mid-capture can be missed, yet marked archived and deletable.
+    # `/archive` locks channels read-only, so this enforces the archive→publish order.
+    if not _is_locked_readonly(channel):
+        raise WikiError("channel is still writable — run /archive to lock it read-only before publishing")
     messages, capture_complete = await capture_channel(channel)
     uploaded = await archive_attachments(client, channel.name, messages)
     namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
