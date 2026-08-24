@@ -110,6 +110,58 @@ class DiscordExportTests(unittest.TestCase):
         self.assertNotIn("<!-- source_channel_id=", page)
         self.assertIn("deletion is blocked", page)
 
+    def test_verified_legacy_incomplete_page_can_be_adopted(self):
+        channel_name = "cpt-267-summer-2023"
+        content = (
+            "''Automated archive of Discord channel'' "
+            "'''#cpt-267-summer-2023''' ''from the GTC Tech Student server.''\n"
+            "archive body\n"
+            "<!-- INCOMPLETE: attachment or capture errors; deletion is blocked. -->"
+        )
+        page = {
+            "revision_count": 1,
+            "user": "DiscordArchiveBot",
+            "comment": "Archive #cpt-267-summer-2023 (800 messages)",
+            "content": content,
+        }
+
+        self.assertTrue(discord_export.is_adoptable_legacy_incomplete_page(
+            page, channel_name, "DiscordArchiveBot",
+        ))
+        self.assertFalse(discord_export.is_adoptable_legacy_incomplete_page(
+            {**page, "revision_count": 2}, channel_name, "DiscordArchiveBot",
+        ))
+        self.assertFalse(discord_export.is_adoptable_legacy_incomplete_page(
+            {**page, "user": "Jonathan"}, channel_name, "DiscordArchiveBot",
+        ))
+        self.assertFalse(discord_export.is_adoptable_legacy_incomplete_page(
+            {**page, "comment": "manual edit"}, channel_name, "DiscordArchiveBot",
+        ))
+        self.assertFalse(discord_export.is_adoptable_legacy_incomplete_page(
+            {**page, "content": content + "\n<!-- source_channel_id=123 captured_at=x captured_until=1 -->"},
+            channel_name,
+            "DiscordArchiveBot",
+        ))
+
+    def test_verified_legacy_part_requires_matching_part_summary(self):
+        channel_name = "ist-272-summer-2023"
+        page = {
+            "revision_count": 1,
+            "user": "DiscordArchiveBot",
+            "comment": "Archive part 2 for #ist-272-summer-2023",
+            "content": (
+                "''Automated archive of Discord channel'' "
+                "'''#ist-272-summer-2023''' ''from the GTC Tech Student server.''\n"
+                "<!-- INCOMPLETE: attachment or capture errors; deletion is blocked. -->"
+            ),
+        }
+        self.assertTrue(discord_export.is_adoptable_legacy_incomplete_page(
+            page, channel_name, "DiscordArchiveBot", part_number=2,
+        ))
+        self.assertFalse(discord_export.is_adoptable_legacy_incomplete_page(
+            page, channel_name, "DiscordArchiveBot", part_number=1,
+        ))
+
     def test_archive_part_is_not_labeled_incomplete(self):
         page = discord_export.render_page(
             "test", [message(1, "hello")], {**self.meta, "complete": False}, part=True

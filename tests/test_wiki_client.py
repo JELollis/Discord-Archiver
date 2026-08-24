@@ -26,7 +26,7 @@ except ModuleNotFoundError:
     aiohttp.ContentTypeError = _ClientResponseError
     sys.modules["aiohttp"] = aiohttp
 
-from wiki_client import MediaWikiClient, WikiError
+from wiki_client import MediaWikiClient, UnexpectedResponseError, WikiError
 
 
 class ExpiredReadClient(MediaWikiClient):
@@ -78,6 +78,35 @@ class FileInfoClient(MediaWikiClient):
             "sha1": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
             "size": 987,
         }]}}}}
+
+
+class PageInfoClient(MediaWikiClient):
+    def __init__(self):
+        super().__init__("https://wiki.invalid/api.php", "bot", "secret")
+        self.logged_in = True
+        self.params = None
+
+    async def _get(self, params):
+        self.params = dict(params)
+        return {"query": {"pages": {"7": {
+            "pageid": 7,
+            "revisions": [
+                {
+                    "revid": 42,
+                    "timestamp": "2026-08-24T18:00:00Z",
+                    "user": "DiscordArchiveBot",
+                    "comment": "Archive #test (3 messages)",
+                    "slots": {"main": {"*": "latest"}},
+                },
+                {
+                    "revid": 41,
+                    "timestamp": "2026-08-24T17:00:00Z",
+                    "user": "DiscordArchiveBot",
+                    "comment": "older",
+                    "slots": {"main": {"*": "older"}},
+                },
+            ],
+        }}}}
 
 
 class RetryingClient(MediaWikiClient):
@@ -143,6 +172,22 @@ class WikiClientTests(unittest.TestCase):
         self.assertEqual(client.params["iiprop"], "sha1|size")
         self.assertIsNone(asyncio.run(FileInfoClient(missing=True).get_file_info("gone.png")))
 
+    def test_get_page_includes_bounded_revision_provenance(self):
+        client = PageInfoClient()
+        result = asyncio.run(client.get_page("Archive:Test"))
+
+        self.assertEqual(result, {
+            "pageid": 7,
+            "revid": 42,
+            "content": "latest",
+            "timestamp": "2026-08-24T18:00:00Z",
+            "user": "DiscordArchiveBot",
+            "comment": "Archive #test (3 messages)",
+            "revision_count": 2,
+        })
+        self.assertEqual(client.params["rvlimit"], "2")
+        self.assertEqual(client.params["rvprop"], "ids|timestamp|user|comment|content")
+
     def test_upload_retries_rate_limit_through_full_window(self):
         limited = ({
             "error": {
@@ -189,6 +234,25 @@ class WikiClientTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.delays, [1.0])
         self.assertEqual(client.discard_calls, 1)
+
+    def test_non_json_api_response_is_diagnostic_and_retryable(self):
+        unexpected = UnexpectedResponseError(
+            status=200,
+            content_type="text/html; charset=UTF-8",
+            server="Apache",
+            preview="MediaWiki API help",
+        )
+        success = ({"upload": {"result": "Success", "filename": "archive.bin"}}, None)
+        client = RetryingClient([unexpected, success])
+
+        result = asyncio.run(client.upload_file("archive.bin", b"content"))
+
+        self.assertEqual(result["filename"], "archive.bin")
+        self.assertEqual(client.delays, [1.0])
+        self.assertEqual(client.discard_calls, 1)
+        self.assertIn("HTTP 200", str(unexpected))
+        self.assertIn("text/html", str(unexpected))
+        self.assertIn("MediaWiki API help", str(unexpected))
 
     def test_mime_mismatch_remains_structured_for_zip_fallback(self):
         failure = ({

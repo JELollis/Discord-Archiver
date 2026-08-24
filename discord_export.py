@@ -35,6 +35,9 @@ _WIKI_ESCAPE = {
 # Characters that start structural wikitext when they lead a line.
 _LINE_LEAD = set("*#:;=! ")
 _BEHAVIOR_SWITCH = re.compile(r"__[A-Z][A-Z0-9_]*__", re.IGNORECASE)
+_LEGACY_INCOMPLETE_MARKER = (
+    "<!-- INCOMPLETE: attachment or capture errors; deletion is blocked. -->"
+)
 
 
 def escape_wikitext(text: str) -> str:
@@ -64,6 +67,46 @@ def escape_wikitext(text: str) -> str:
             line = f"&#{ord(line[0])};{line[1:]}"
         out.append(line)
     return "\n".join(out)
+
+
+def is_adoptable_legacy_incomplete_page(
+    page: dict,
+    channel_name: str,
+    bot_username: str,
+    *,
+    part_number: int | None = None,
+) -> bool:
+    """Return whether an old marker-less bot page is safe to migrate.
+
+    Early archiver versions wrote an ``INCOMPLETE`` page without a stable
+    channel ownership marker. Adoption is deliberately much stricter than the
+    normal ownership check: only a single-revision page with the exact legacy
+    marker, generated header, bot author, and edit summary is eligible.
+    """
+    if page.get("revision_count") != 1 or page.get("user") != bot_username:
+        return False
+    content = page.get("content", "")
+    if not isinstance(content, str):
+        return False
+    if "<!-- archive_owner_channel_id=" in content or "<!-- source_channel_id=" in content:
+        return False
+    if content.count(_LEGACY_INCOMPLETE_MARKER) != 1:
+        return False
+    expected_header = (
+        "''Automated archive of Discord channel'' "
+        f"'''#{escape_wikitext(channel_name)}''' "
+        "''from the GTC Tech Student server.''"
+    )
+    if content.count(expected_header) != 1:
+        return False
+
+    comment = page.get("comment", "")
+    if part_number is not None:
+        return comment == f"Archive part {part_number} for #{channel_name}"
+    return bool(re.fullmatch(
+        rf"Archive #{re.escape(channel_name)} \(\d+ messages\)",
+        str(comment),
+    ))
 
 
 def resolve_mentions(text: str, guild, *, members=None, channels=None, roles=None) -> str:

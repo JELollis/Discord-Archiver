@@ -208,14 +208,31 @@ def _page_owner_id(content: str) -> int | None:
 
 
 async def _require_owned_or_missing_page(
-    client: MediaWikiClient, title: str, channel_id: int
+    client: MediaWikiClient,
+    title: str,
+    channel_id: int,
+    channel_name: str,
+    *,
+    legacy_part_number: int | None = None,
 ) -> dict | None:
-    """Refuse to overwrite an existing page unless this channel owns it."""
+    """Require channel ownership, with a strict one-time legacy migration."""
     page = await client.get_page(title)
     if page is None:
         return None
     owner_id = _page_owner_id(page["content"])
     if owner_id is None:
+        bot_username = client.username.split("@", 1)[0]
+        if discord_export.is_adoptable_legacy_incomplete_page(
+            page,
+            channel_name,
+            bot_username,
+            part_number=legacy_part_number,
+        ):
+            logging.warning(
+                "Adopting verified legacy incomplete archive page %r for channel %s",
+                title, channel_id,
+            )
+            return page
         raise WikiError(
             f"archive page {title!r} already exists without a bot ownership marker; refusing to overwrite it")
     if owner_id != channel_id:
@@ -1286,7 +1303,9 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     uploaded = await archive_attachments(client, channel.name, messages)
     namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
     title = discord_export.make_page_title(channel.name, namespace)
-    canonical_page = await _require_owned_or_missing_page(client, title, channel.id)
+    canonical_page = await _require_owned_or_missing_page(
+        client, title, channel.id, channel.name,
+    )
     real_messages = [m for m in messages if not m.get("thread_header")]
     thread_names = {
         m["id"]: m["thread_header"]
@@ -1344,10 +1363,15 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         }
         # Preflight every target before changing any part, so a collision on a
         # later part cannot leave earlier parts partially overwritten.
-        existing_parts = {
-            part_title: await _require_owned_or_missing_page(client, part_title, channel.id)
-            for part_title in part_titles
-        }
+        existing_parts = {}
+        for idx, part_title in enumerate(part_titles, 1):
+            existing_parts[part_title] = await _require_owned_or_missing_page(
+                client,
+                part_title,
+                channel.id,
+                channel.name,
+                legacy_part_number=idx,
+            )
         for idx, part in enumerate(parts, 1):
             part_title = part_titles[idx - 1]
             existing_part = existing_parts[part_title]

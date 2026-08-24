@@ -75,6 +75,29 @@ class WikiError(Exception):
         )
 
 
+class UnexpectedResponseError(Exception):
+    """Raised when the API returns a successful response that is not JSON."""
+
+    def __init__(
+        self,
+        *,
+        status: int,
+        content_type: str,
+        server: str,
+        preview: str,
+    ):
+        self.status = status
+        self.content_type = content_type
+        self.server = server
+        self.preview = preview
+        details = f"HTTP {status}, content-type {content_type or 'missing'}"
+        if server:
+            details += f", server {server}"
+        if preview:
+            details += f", body starts: {preview!r}"
+        super().__init__(f"MediaWiki API returned non-JSON response ({details})")
+
+
 def load_config(env: Optional[dict] = None) -> dict:
     """Return the MediaWiki settings from the environment, with a file fallback.
 
@@ -211,6 +234,16 @@ class MediaWikiClient:
             method, self.api_url, **request_kwargs
         ) as resp:
             resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type.lower():
+                body = await resp.text(errors="replace")
+                preview = " ".join(body.split())[:240]
+                raise UnexpectedResponseError(
+                    status=resp.status,
+                    content_type=content_type,
+                    server=resp.headers.get("Server", ""),
+                    preview=preview,
+                )
             result = await resp.json()
             return result, self._retry_after_seconds(resp.headers)
 
@@ -245,8 +278,8 @@ class MediaWikiClient:
                 result, retry_after = await self._request_once(
                     method, params=params, data=data, files=files
                 )
-            except aiohttp.ContentTypeError as exc:
-                # Cloudflare/proxies occasionally return an HTML response with 200.
+            except (UnexpectedResponseError, aiohttp.ContentTypeError) as exc:
+                # A proxy or upstream PHP failure can return HTML with HTTP 200.
                 retryable_exc = exc
             except (
                 aiohttp.ClientConnectionError,
@@ -444,12 +477,15 @@ class MediaWikiClient:
         return (await self._retry_after_auth_error(submit))["upload"]
 
     async def get_page(self, title: str) -> Optional[dict]:
-        """Return {pageid, revid, content} for the latest revision, or None."""
+        """Return latest content and bounded revision metadata, or ``None``."""
         result = await self._authenticated_get({
             "action": "query",
             "prop": "revisions",
-            "rvprop": "ids|content",
+            "rvprop": "ids|timestamp|user|comment|content",
             "rvslots": "main",
+            # Two revisions are enough to distinguish an untouched legacy page
+            # from anything edited later; no unbounded history fetch is needed.
+            "rvlimit": "2",
             "titles": title,
         })
         page = next(iter(result["query"]["pages"].values()))
@@ -460,6 +496,10 @@ class MediaWikiClient:
             "pageid": page["pageid"],
             "revid": revision["revid"],
             "content": revision["slots"]["main"]["*"],
+            "timestamp": revision.get("timestamp"),
+            "user": revision.get("user"),
+            "comment": revision.get("comment", ""),
+            "revision_count": len(page["revisions"]),
         }
 
     async def get_file_info(self, filename: str) -> Optional[dict]:

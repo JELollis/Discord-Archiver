@@ -130,6 +130,18 @@ After changing `LocalSettings.php`, run `php -l` before reloading the web server
 or MIME-mismatched attachments inside a ZIP, so an unfamiliar file type cannot make an archive appear complete
 while silently dropping content.
 
+PHP's request limit must also be at least as large as MediaWiki's upload limit. For a wiki configured with
+`$wgMaxUploadSize = 100 * 1024 * 1024`, use an Apache PHP override such as:
+
+```ini
+upload_max_filesize = 100M
+post_max_size = 128M
+```
+
+`post_max_size` must be larger than `upload_max_filesize` to leave room for multipart form overhead. If it is
+smaller, PHP discards the request before MediaWiki can handle it and `api.php` may return an HTML page with HTTP
+200 instead of the expected JSON response.
+
 ## Security notes
 
 - Secrets (`Bot Key.txt`, `wiki.env`, wiki `LocalSettings.php`/`private.php`, keys/certs) are **gitignored**
