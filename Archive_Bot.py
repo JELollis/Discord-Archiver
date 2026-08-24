@@ -148,76 +148,6 @@ async def _iter_threads(channel):
                 yield th
 
 
-async def _collect_history_page(stream, limit: int, before):
-    return [
-        message
-        async for message in stream.history(
-            limit=limit,
-            before=before,
-            oldest_first=False,
-        )
-    ]
-
-
-async def _iter_paced_history(stream, label: str, *, limit: int | None = None):
-    """Yield history in explicit pages with five seconds between REST requests."""
-    before = None
-    remaining = limit
-    while remaining is None or remaining > 0:
-        page_limit = 100 if remaining is None else min(100, remaining)
-        page = await _delete_discord_pacer.run(
-            f"read {label} history",
-            lambda page_limit=page_limit, before=before: _collect_history_page(
-                stream, page_limit, before),
-        )
-        if not page:
-            return
-        for message in page:
-            yield message
-        if remaining is not None:
-            remaining -= len(page)
-        if len(page) < page_limit:
-            return
-        before = page[-1]
-
-
-async def _collect_archived_thread_page(channel, private: bool, before):
-    return [
-        thread
-        async for thread in channel.archived_threads(
-            private=private,
-            limit=100,
-            before=before,
-        )
-    ]
-
-
-async def _iter_paced_threads(channel):
-    """Yield active and archived threads with paced archived-thread pages."""
-    seen = set()
-    for thread in list(getattr(channel, "threads", [])):
-        if thread.id not in seen:
-            seen.add(thread.id)
-            yield thread
-    for private in (False, True):
-        before = None
-        while True:
-            page = await _delete_discord_pacer.run(
-                f"list {'private' if private else 'public'} archived threads for #{channel.name}",
-                lambda private=private, before=before: _collect_archived_thread_page(
-                    channel, private, before),
-            )
-            if not page:
-                break
-            for thread in page:
-                if thread.id not in seen:
-                    seen.add(thread.id)
-                    yield thread
-            if len(page) < 100:
-                break
-            before = page[-1]
-
-
 def _archive_marker_re(channel_id: int) -> re.Pattern:
     """Regex matching ONLY the complete bot-generated archive marker comment.
 
@@ -460,11 +390,7 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
             history = getattr(channel, "history", None)
             if history is None:
                 return False
-            async for _message in _iter_paced_history(
-                channel,
-                f"#{channel.name}",
-                limit=1,
-            ):
+            async for _message in channel.history(limit=1):
                 return False
             return True
         except Exception as exc:
@@ -552,12 +478,12 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
     try:
         if not await _stream_current(
             channel.id,
-            _iter_paced_history(channel, f"#{channel.name}"),
+            channel.history(limit=None, oldest_first=False),
         ):
             return False
         # Every thread (active + archived) must also be captured and unedited; a
         # failure to list or read threads blocks deletion (contents unprovable).
-        threads = [thread async for thread in _iter_paced_threads(channel)]
+        threads = [thread async for thread in _iter_threads(channel)]
         current_threads = {
             thread.id: discord_export.content_sha256(thread.name)
             for thread in threads
@@ -568,7 +494,7 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
         for thread in threads:
             if not await _stream_current(
                 thread.id,
-                _iter_paced_history(thread, f"thread {thread.name} in #{channel.name}"),
+                thread.history(limit=None, oldest_first=False),
             ):
                 return False
     except Exception as exc:

@@ -1,63 +1,81 @@
 """Conservative Discord API pacing helpers for destructive archive cleanup."""
 
 import asyncio
+import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 
 MIN_DISCORD_ACTION_INTERVAL_SECONDS = 5.0
+DISCORD_RETRY_BUFFER_SECONDS = 1.0
 _T = TypeVar("_T")
 
 
 def additional_retry_delay(
     retry_after: float,
-    minimum: float = MIN_DISCORD_ACTION_INTERVAL_SECONDS,
+    buffer_seconds: float = DISCORD_RETRY_BUFFER_SECONDS,
 ) -> float:
-    """Extra delay needed so Discord's own retry wait totals at least ``minimum``."""
-    return max(0.0, minimum - max(0.0, retry_after))
+    """Extra delay needed to make the total wait ``ceil(retry_after) + buffer``."""
+    retry_after = max(0.0, float(retry_after))
+    target_wait = math.ceil(retry_after) + max(0.0, float(buffer_seconds))
+    return target_wait - retry_after
 
 
-async def _enforce_minimum_429_wait(_session, _context, params) -> None:
-    """Add a floor to discord.py's header-aware 429 retry delay.
+async def _enforce_buffered_429_wait(_session, _context, params) -> None:
+    """Round Discord's JSON retry delay up and add a one-second buffer.
 
-    discord.py subsequently sleeps for the full Retry-After value parsed from
-    the response JSON. Sleeping only the difference here preserves longer
-    server-directed waits while turning a 0.8-second retry into a five-second
-    total cooldown.
+    discord.py subsequently sleeps for the unrounded ``retry_after`` value from
+    the same response JSON. Sleeping only the difference here makes the combined
+    cooldown ``ceil(retry_after) + 1`` without doubling the server-directed wait.
     """
     response = getattr(params, "response", None)
     if response is None or getattr(response, "status", None) != 429:
         return
 
-    raw_retry_after = response.headers.get("Retry-After")
+    raw_retry_after = None
+    try:
+        data = await response.json(content_type=None)
+        logging.warning(
+            "Discord HTTP 429 response JSON: %s",
+            json.dumps(data, ensure_ascii=False, sort_keys=True, default=str),
+        )
+        if isinstance(data, dict):
+            raw_retry_after = data.get("retry_after")
+    except Exception:
+        logging.warning("Could not parse Discord's HTTP 429 JSON response; using Retry-After header.")
+
     if raw_retry_after is None:
-        # Discord documents Retry-After on 429 responses. If it is unexpectedly
-        # absent, add the complete conservative floor before discord.py handles
-        # the response body.
-        extra_delay = MIN_DISCORD_ACTION_INTERVAL_SECONDS
-    else:
-        try:
-            extra_delay = additional_retry_delay(float(raw_retry_after))
-        except (TypeError, ValueError):
-            extra_delay = MIN_DISCORD_ACTION_INTERVAL_SECONDS
+        raw_retry_after = response.headers.get("Retry-After")
+
+    try:
+        retry_after = max(0.0, float(raw_retry_after))
+        extra_delay = additional_retry_delay(retry_after)
+    except (TypeError, ValueError):
+        # Discord documents retry_after in every 429 JSON response. If both the
+        # JSON and fallback header are malformed, add the one-second safety
+        # buffer while discord.py handles (or rejects) the response itself.
+        retry_after = 0.0
+        extra_delay = DISCORD_RETRY_BUFFER_SECONDS
 
     if extra_delay > 0:
         logging.warning(
-            "Discord returned HTTP 429; adding %.2f seconds so the retry cooldown is at least %.2f seconds.",
+            "Discord returned HTTP 429 (retry_after=%.2f); adding %.2f seconds for a %.2f-second total cooldown.",
+            retry_after,
             extra_delay,
-            MIN_DISCORD_ACTION_INTERVAL_SECONDS,
+            retry_after + extra_delay,
         )
         await asyncio.sleep(extra_delay)
 
 
 def build_discord_http_trace():
-    """Return an aiohttp trace that enforces the minimum 429 cooldown."""
+    """Return an aiohttp trace that adds a rounded buffer to 429 cooldowns."""
     import aiohttp
 
     trace = aiohttp.TraceConfig()
-    trace.on_request_end.append(_enforce_minimum_429_wait)
+    trace.on_request_end.append(_enforce_buffered_429_wait)
     return trace
 
 

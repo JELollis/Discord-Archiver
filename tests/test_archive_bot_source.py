@@ -87,6 +87,31 @@ class ArchiveBotSourceTests(unittest.TestCase):
             "The deletion callback must set self.processing before its first await",
         )
 
+    def test_delete_pacer_is_only_used_for_destructive_requests(self):
+        """Successful verification reads must not incur the five-second delete delay."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        labels = []
+
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "_delete_discord_pacer"
+            ):
+                continue
+            labels.append(node.args[0])
+
+        self.assertEqual(len(labels), 2)
+        self.assertTrue(all(
+            isinstance(label, ast.JoinedStr)
+            and label.values
+            and isinstance(label.values[0], ast.Constant)
+            and label.values[0].value.startswith("delete ")
+            for label in labels
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

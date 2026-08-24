@@ -4,33 +4,78 @@ from unittest.mock import AsyncMock, patch
 
 from discord_rate_limit import (
     AsyncActionPacer,
-    _enforce_minimum_429_wait,
+    _enforce_buffered_429_wait,
     additional_retry_delay,
 )
 
 
 class DiscordRateLimitTests(unittest.IsolatedAsyncioTestCase):
-    def test_retry_delay_has_five_second_floor(self):
-        self.assertAlmostEqual(additional_retry_delay(0.8), 4.2)
-        self.assertEqual(additional_retry_delay(5.0), 0.0)
-        self.assertEqual(additional_retry_delay(64.57), 0.0)
+    def test_retry_delay_rounds_up_and_adds_one_second(self):
+        self.assertAlmostEqual(additional_retry_delay(0.8), 1.2)
+        self.assertEqual(additional_retry_delay(5.0), 1.0)
+        self.assertAlmostEqual(additional_retry_delay(64.57), 1.43)
 
-    async def test_429_trace_adds_only_the_missing_floor_delay(self):
+    async def test_429_trace_uses_json_and_adds_only_the_rounding_buffer(self):
         params = SimpleNamespace(
-            response=SimpleNamespace(status=429, headers={"Retry-After": "0.8"})
+            response=SimpleNamespace(
+                status=429,
+                headers={"Retry-After": "20.0"},
+                json=AsyncMock(return_value={"retry_after": 0.8}),
+            )
         )
         with patch("discord_rate_limit.asyncio.sleep", new_callable=AsyncMock) as sleep:
-            await _enforce_minimum_429_wait(None, None, params)
+            await _enforce_buffered_429_wait(None, None, params)
         sleep.assert_awaited_once()
-        self.assertAlmostEqual(sleep.await_args.args[0], 4.2)
+        self.assertAlmostEqual(sleep.await_args.args[0], 1.2)
 
-    async def test_429_trace_preserves_longer_server_delay(self):
+    async def test_429_trace_rounds_up_longer_server_delay(self):
         params = SimpleNamespace(
-            response=SimpleNamespace(status=429, headers={"Retry-After": "64.57"})
+            response=SimpleNamespace(
+                status=429,
+                headers={},
+                json=AsyncMock(return_value={"retry_after": 64.57}),
+            )
         )
         with patch("discord_rate_limit.asyncio.sleep", new_callable=AsyncMock) as sleep:
-            await _enforce_minimum_429_wait(None, None, params)
-        sleep.assert_not_awaited()
+            await _enforce_buffered_429_wait(None, None, params)
+        sleep.assert_awaited_once()
+        self.assertAlmostEqual(sleep.await_args.args[0], 1.43)
+
+    async def test_429_trace_falls_back_to_retry_after_header(self):
+        params = SimpleNamespace(
+            response=SimpleNamespace(
+                status=429,
+                headers={"Retry-After": "2.25"},
+                json=AsyncMock(side_effect=ValueError("bad JSON")),
+            )
+        )
+        with patch("discord_rate_limit.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await _enforce_buffered_429_wait(None, None, params)
+        self.assertAlmostEqual(sleep.await_args.args[0], 1.75)
+
+    async def test_429_trace_logs_full_json_response(self):
+        body = {
+            "message": "You are being rate limited.",
+            "retry_after": 3.4,
+            "global": False,
+        }
+        params = SimpleNamespace(
+            response=SimpleNamespace(
+                status=429,
+                headers={},
+                json=AsyncMock(return_value=body),
+            )
+        )
+        with (
+            self.assertLogs(level="WARNING") as logs,
+            patch("discord_rate_limit.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await _enforce_buffered_429_wait(None, None, params)
+
+        output = "\n".join(logs.output)
+        self.assertIn('"global": false', output)
+        self.assertIn('"message": "You are being rate limited."', output)
+        self.assertIn('"retry_after": 3.4', output)
 
     async def test_actions_are_spaced_five_seconds_apart(self):
         now = [100.0]
