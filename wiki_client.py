@@ -112,7 +112,12 @@ class MediaWikiClient:
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
+            # Timeouts so a stalled wiki/Cloudflare connection fails fast instead of
+            # hanging the whole bot forever. No hard total (large uploads may run
+            # long), but a connection that goes silent for sock_read seconds aborts.
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
+            self._session = aiohttp.ClientSession(
+                headers={"User-Agent": USER_AGENT}, timeout=timeout)
             self._owns_session = True
 
     async def _get(self, params: dict) -> dict:
