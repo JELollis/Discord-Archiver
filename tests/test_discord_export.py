@@ -48,6 +48,31 @@ class DiscordExportTests(unittest.TestCase):
         self.assertLessEqual(len(first.encode("utf-8")), 200)
         self.assertTrue(first.endswith(".png"))
 
+    def test_zip_fallback_removes_compound_extensions_from_upload_name(self):
+        upload_name = (
+            "1211726263379689482-1211726262968655902-"
+            "cpt-187-spring-2024-Lab8-4_Selenium.py"
+        )
+        zip_name = discord_export.zip_fallback_upload_name(upload_name)
+
+        self.assertTrue(zip_name.endswith("-Lab8-4_Selenium_py.zip"))
+        self.assertEqual(zip_name.count("."), 1)
+        self.assertLessEqual(len(zip_name.encode("utf-8")), 200)
+
+    def test_zip_fallback_keeps_ids_when_long_names_are_truncated(self):
+        upload_name = discord_export.attachment_upload_name(
+            "界" * 100,
+            111,
+            222,
+            ("😀" * 100) + ".tar.py",
+        )
+        zip_name = discord_export.zip_fallback_upload_name(upload_name)
+
+        self.assertTrue(zip_name.startswith("111-222-"))
+        self.assertTrue(zip_name.endswith(".zip"))
+        self.assertEqual(zip_name.count("."), 1)
+        self.assertLessEqual(len(zip_name.encode("utf-8")), 200)
+
     def test_part_manifest_is_contiguous_and_hashes_saved_content(self):
         manifest = [
             (1, discord_export.content_sha256("part one")),

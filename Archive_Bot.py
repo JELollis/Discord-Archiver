@@ -362,7 +362,7 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
                         raise
                     # The wiki cannot safely accept this type directly; preserve it
                     # inside a ZIP while leaving MIME/executable checks enabled.
-                    zip_name = discord_export.sanitize_filename(f"{name}.zip")
+                    zip_name = discord_export.zip_fallback_upload_name(name)
                     uploaded_data = _zip_bytes(att["filename"], data)
                     result = await client.upload_file(
                         zip_name, uploaded_data,

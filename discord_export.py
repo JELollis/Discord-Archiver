@@ -333,6 +333,17 @@ def attachment_upload_name(channel_name: str, message_id: int, attachment_id: in
     return sanitize_filename(f"{message_id}-{attachment_id}-{channel_name}-{filename}")
 
 
+def zip_fallback_upload_name(upload_name: str) -> str:
+    """Return a ZIP name that cannot retain a blacklisted compound extension.
+
+    MediaWiki checks every extension segment in names such as ``script.py.zip``.
+    Replace dots in the original upload name before adding the permitted ZIP
+    extension; the archived file itself keeps its original name inside the ZIP.
+    """
+    extension_safe_stem = sanitize_filename(upload_name).replace(".", "_")
+    return sanitize_filename(f"{extension_safe_stem}.zip")
+
+
 _IMAGE_EXT = {"png", "gif", "jpg", "jpeg", "webp"}
 
 
