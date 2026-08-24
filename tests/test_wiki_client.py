@@ -46,6 +46,23 @@ class CapturingEditClient(MediaWikiClient):
         return {"edit": {"result": "Success", "newrevid": 43}}
 
 
+class FileInfoClient(MediaWikiClient):
+    def __init__(self, *, missing=False):
+        super().__init__("https://wiki.invalid/api.php", "bot", "secret")
+        self.logged_in = True
+        self.missing = missing
+        self.params = None
+
+    async def _get(self, params):
+        self.params = dict(params)
+        if self.missing:
+            return {"query": {"pages": {"-1": {"missing": ""}}}}
+        return {"query": {"pages": {"7": {"imageinfo": [{
+            "sha1": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+            "size": 987,
+        }]}}}}
+
+
 class WikiClientTests(unittest.TestCase):
     def test_private_read_reauthenticates_once_after_session_expiry(self):
         client = ExpiredReadClient()
@@ -67,6 +84,17 @@ class WikiClientTests(unittest.TestCase):
         ))
         self.assertEqual(client.submitted["createonly"], "1")
         self.assertNotIn("baserevid", client.submitted)
+
+    def test_file_info_returns_current_digest_and_size(self):
+        client = FileInfoClient()
+        result = asyncio.run(client.get_file_info("archive.png"))
+        self.assertEqual(result, {
+            "sha1": "abcdef0123456789abcdef0123456789abcdef01",
+            "size": 987,
+        })
+        self.assertEqual(client.params["titles"], "File:archive.png")
+        self.assertEqual(client.params["iiprop"], "sha1|size")
+        self.assertIsNone(asyncio.run(FileInfoClient(missing=True).get_file_info("gone.png")))
 
 
 if __name__ == "__main__":

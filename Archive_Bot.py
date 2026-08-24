@@ -5,6 +5,7 @@ import datetime
 import os
 import io
 import zipfile
+import hashlib
 import logging
 import urllib.parse
 import re
@@ -239,6 +240,20 @@ async def _archive_parts_match(
     return True
 
 
+async def _archive_attachments_match(
+    client: MediaWikiClient,
+    manifest: list[tuple[str, str, int]],
+) -> bool:
+    """Verify every uploaded file still has the captured bytes."""
+    for filename, expected_digest, expected_size in manifest:
+        info = await client.get_file_info(filename)
+        if (info is None
+                or info["sha1"] != expected_digest
+                or info["size"] != expected_size):
+            return False
+    return True
+
+
 async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     """Read a channel's full history AND all its threads (oldest first).
 
@@ -309,6 +324,7 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
                     raise WikiError(f"attachment exceeds the {limit_mb} MiB archive limit")
                 data = await obj.read()
                 name = discord_export.attachment_upload_name(channel_name, m["id"], att["id"], att["filename"])
+                uploaded_data = data
                 try:
                     result = await client.upload_file(name, data, comment=f"Discord attachment from #{channel_name}")
                     att["wiki_filename"] = result.get("filename") or name
@@ -317,11 +333,14 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
                         raise
                     # Wiki disallows this type: preserve it inside a .zip instead.
                     zip_name = discord_export.sanitize_filename(f"{name}.zip")
+                    uploaded_data = _zip_bytes(att["filename"], data)
                     result = await client.upload_file(
-                        zip_name, _zip_bytes(att["filename"], data),
+                        zip_name, uploaded_data,
                         comment=f"Discord attachment (zipped) from #{channel_name}")
                     att["wiki_filename"] = result.get("filename") or zip_name
                     att["zipped"] = True
+                att["wiki_sha1"] = hashlib.sha1(uploaded_data).hexdigest()
+                att["wiki_size"] = len(uploaded_data)
                 uploaded += 1
             except Exception as exc:
                 att["error"] = str(exc)
@@ -358,6 +377,9 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
     page = await client.get_page(title)
     if not page:
         return False
+    if not discord_export.verify_canonical_content(page["content"]):
+        logging.warning("Canonical archive content changed for #%s; blocking deletion.", channel.name)
+        return False
     marker = _archive_marker_re(channel.id).search(page["content"])
     if not marker:
         return False
@@ -383,6 +405,22 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
             return False
     except Exception as exc:
         logging.warning("Could not verify split archive parts for #%s: %s", channel.name, exc)
+        return False
+    attachment_manifest = discord_export.parse_attachment_manifest(page["content"])
+    if attachment_manifest is None:
+        logging.warning("Missing or ambiguous attachment manifest for #%s; blocking deletion.", channel.name)
+        return False
+    try:
+        if not await _archive_attachments_match(client, attachment_manifest):
+            logging.warning("Archived attachments changed or are missing for #%s; blocking deletion.", channel.name)
+            return False
+    except Exception as exc:
+        logging.warning("Could not verify archived attachments for #%s: %s", channel.name, exc)
+        return False
+    thread_manifest = discord_export.parse_thread_manifest(page["content"])
+    expected_thread_ids = set(stream_boundaries) - {channel.id}
+    if thread_manifest is None or set(thread_manifest) != expected_thread_ids:
+        logging.warning("Missing or ambiguous thread manifest for #%s; blocking deletion.", channel.name)
         return False
     # Keep enforcing the operator workflow at deletion time as an additional
     # safety layer; per-stream boundaries below cover admin/webhook bypasses.
@@ -412,7 +450,15 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
             return False
         # Every thread (active + archived) must also be captured and unedited; a
         # failure to list or read threads blocks deletion (contents unprovable).
-        async for thread in _iter_threads(channel):
+        threads = [thread async for thread in _iter_threads(channel)]
+        current_threads = {
+            thread.id: discord_export.content_sha256(thread.name)
+            for thread in threads
+        }
+        if current_threads != thread_manifest:
+            logging.warning("Thread set or names changed for #%s; blocking deletion.", channel.name)
+            return False
+        for thread in threads:
             if not await _stream_current(thread.id, thread.history(limit=None, oldest_first=False)):
                 return False
     except Exception as exc:
@@ -1240,6 +1286,11 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     title = discord_export.make_page_title(channel.name, namespace)
     canonical_page = await _require_owned_or_missing_page(client, title, channel.id)
     real_messages = [m for m in messages if not m.get("thread_header")]
+    thread_names = {
+        m["id"]: m["thread_header"]
+        for m in messages
+        if m.get("thread_header")
+    }
     stream_boundaries = {channel.id: 0}
     for message in messages:
         if message.get("thread_header"):
@@ -1254,6 +1305,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "captured_at": _format_capture_time(capture_started),
         "captured_until": max((m["id"] for m in real_messages), default=0),
         "stream_boundaries": stream_boundaries,
+        "thread_names": thread_names,
         "message_count": len(real_messages),
         # Incomplete if any attachment failed OR thread enumeration/read failed;
         # an incomplete archive omits the completion marker and blocks deletion.
@@ -1262,7 +1314,9 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     course_match = re.match(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", channel.name.strip(), re.I)
     if course_match:
         meta["category"] = f"{course_match.group(1).upper()}-{course_match.group(2)}"
-    parts = discord_export.split_messages(messages, channel.name, meta)
+    parts = discord_export.split_messages(
+        messages, channel.name, meta, page_title=title,
+    )
     if course_match:
         course = f"{course_match.group(1).upper()}-{course_match.group(2)}"
         department = course_match.group(1).upper()
@@ -1328,9 +1382,21 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
             channel.name, messages, {**meta, "complete": False},
             anchor_index=anchor_index, self_title=title,
         )
+    attachment_manifest = sorted(
+        (
+            att["wiki_filename"],
+            att["wiki_sha1"],
+            att["wiki_size"],
+        )
+        for message in messages
+        for att in message["attachments"]
+        if "error" not in att
+    )
     manifest_text = discord_export.render_part_manifest(part_manifest)
-    final_text = f"{final_text}\n{manifest_text}\n"
-    staged_text = f"{staged_text}\n{manifest_text}\n"
+    attachment_text = discord_export.render_attachment_manifest(attachment_manifest)
+    final_text = f"{final_text}\n{manifest_text}\n{attachment_text}\n"
+    final_text = discord_export.seal_canonical_content(final_text)
+    staged_text = f"{staged_text}\n{manifest_text}\n{attachment_text}\n"
     edit = await client.edit_page(
         title, staged_text, f"Stage archive #{channel.name} ({len(real_messages)} messages)",
         createonly=canonical_page is None,
@@ -1340,14 +1406,20 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     saved_owner = _OWNER_MARKER_RE.search(page["content"]) if page else None
     owner_present = bool(saved_owner and int(saved_owner.group(1)) == channel.id)
     saved_manifest = discord_export.parse_part_manifest(page["content"] if page else "")
+    saved_attachments = discord_export.parse_attachment_manifest(page["content"] if page else "")
     staged_parts_match = await _archive_parts_match(
         client, title, channel.id, part_manifest
+    )
+    staged_attachments_match = await _archive_attachments_match(
+        client, attachment_manifest
     )
     staged_verified = bool(
         owner_present
         and _edit_matches_readback(edit, page)
         and saved_manifest == part_manifest
+        and saved_attachments == attachment_manifest
         and staged_parts_match
+        and staged_attachments_match
     )
     ready = bool(meta["complete"] and staged_verified)
     if not meta["complete"]:
@@ -1366,6 +1438,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "_final_text": final_text if ready else None,
         "_stream_boundaries": stream_boundaries,
         "_part_manifest": part_manifest,
+        "_attachment_manifest": attachment_manifest,
     }
 
 
@@ -1374,12 +1447,15 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
     final_text = result.pop("_final_text", None)
     expected_streams = result.pop("_stream_boundaries", {})
     expected_parts = result.pop("_part_manifest", [])
+    expected_attachments = result.pop("_attachment_manifest", [])
     if not final_text:
         raise WikiError("archive was not ready for finalisation")
     if not await _archive_parts_match(
         client, result["title"], result["channel"].id, expected_parts
     ):
         raise WikiError("archive parts changed before finalisation")
+    if not await _archive_attachments_match(client, expected_attachments):
+        raise WikiError("archived attachments changed before finalisation")
     edit = await client.edit_page(
         result["title"], final_text,
         f"Finalise announced archive #{result['channel'].name}",
@@ -1398,15 +1474,22 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
         for stream_id, boundary in _STREAM_MARKER_RE.findall(page["content"] if page else "")
     }
     saved_parts = discord_export.parse_part_manifest(page["content"] if page else "")
+    saved_attachments = discord_export.parse_attachment_manifest(page["content"] if page else "")
     parts_match = await _archive_parts_match(
         client, result["title"], result["channel"].id, expected_parts
+    )
+    attachments_match = await _archive_attachments_match(
+        client, expected_attachments
     )
     if not (_edit_matches_readback(edit, page)
             and owner_matches
             and marker_present
             and saved_streams == expected_streams
             and saved_parts == expected_parts
-            and parts_match):
+            and saved_attachments == expected_attachments
+            and parts_match
+            and attachments_match
+            and discord_export.verify_canonical_content(page["content"] if page else "")):
         raise WikiError("final archive failed read-back verification")
     result["revid"] = page["revid"]
     result["ok"] = True

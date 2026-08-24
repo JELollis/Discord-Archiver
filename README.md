@@ -5,7 +5,7 @@ channels/roles and **permanently archives Discord channels to a private, Discord
 MediaWiki** before they are deleted.
 
 The bot captures a channel's full history, uploads its attachments, publishes a wiki page, and
-**verifies the page saved** before the channel is allowed to be removed — so nothing is lost.
+**revalidates the saved page, split parts, files, and thread names** before the channel can be removed.
 
 ---
 
@@ -16,8 +16,9 @@ The bot captures a channel's full history, uploads its attachments, publishes a 
 - **Wiki archiving** — copy a Discord text channel to the wiki as a formatted page (authors,
   timestamps, message text with mentions resolved, attachments, reply links), with read-back
   verification and a link posted to `#archives`.
-- **Guarded deletion** — text channels require a current verified wiki archive; unsupported message
-  channels are blocked, and voice/stage channels must have empty persistent text chat.
+- **Guarded deletion** — text channels require a current integrity-sealed wiki archive whose pages,
+  attachments, thread names, and message boundaries still match; unsupported message channels are
+  blocked, and voice/stage channels must have empty persistent text chat.
 - **Private wiki with Discord SSO** — the wiki is readable only by verified members, logging in with
   Discord via Authentik (OpenID Connect).
 

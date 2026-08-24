@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import hashlib
+import urllib.parse
 from datetime import timezone
 
 # Discord entity references embedded in message content.
@@ -102,6 +103,17 @@ def resolve_mentions(text: str, guild, *, members=None, channels=None, roles=Non
 _TITLE_BAD = re.compile(r"[#<>\[\]|{}/:]+")
 _PART_COUNT_RE = re.compile(r"<!-- archive_part_count=(\d+) -->")
 _PART_MARKER_RE = re.compile(r"<!-- archive_part=(\d+) sha256=([0-9a-f]{64}) -->")
+_ATTACHMENT_COUNT_RE = re.compile(r"<!-- archive_attachment_count=(\d+) -->")
+_ATTACHMENT_MARKER_RE = re.compile(
+    r"<!-- archive_attachment filename=([^ \n]+) sha1=([0-9a-f]{40}) size=(\d+) -->"
+)
+_THREAD_COUNT_RE = re.compile(r"<!-- source_thread_count=(\d+) -->")
+_THREAD_MARKER_RE = re.compile(
+    r"<!-- source_thread_id=(\d+) name_sha256=([0-9a-f]{64}) -->"
+)
+_CANONICAL_MARKER_RE = re.compile(
+    r"<!-- archive_canonical_sha256=([0-9a-f]{64}) -->"
+)
 
 
 def _truncate_bytes(text: str, max_bytes: int) -> str:
@@ -140,6 +152,83 @@ def parse_part_manifest(content: str) -> list[tuple[int, str]] | None:
     if [number for number, _digest in entries] != list(range(1, expected_count + 1)):
         return None
     return entries
+
+
+def render_attachment_manifest(
+    attachments: list[tuple[str, str, int]],
+) -> str:
+    """Render current wiki filenames, SHA-1 digests, and byte sizes."""
+    ordered = sorted(attachments)
+    lines = [f"<!-- archive_attachment_count={len(ordered)} -->"]
+    lines.extend(
+        "<!-- archive_attachment "
+        f"filename={urllib.parse.quote(filename, safe='')} sha1={digest} size={size} -->"
+        for filename, digest, size in ordered
+    )
+    return "\n".join(lines)
+
+
+def parse_attachment_manifest(
+    content: str,
+) -> list[tuple[str, str, int]] | None:
+    """Parse one complete, unique attachment integrity manifest."""
+    count_matches = _ATTACHMENT_COUNT_RE.findall(content)
+    if len(count_matches) != 1:
+        return None
+    expected_count = int(count_matches[0])
+    entries = []
+    for encoded, digest, size in _ATTACHMENT_MARKER_RE.findall(content):
+        filename = urllib.parse.unquote(encoded)
+        if urllib.parse.quote(filename, safe="") != encoded:
+            return None
+        entries.append((filename, digest, int(size)))
+    if len(entries) != expected_count or len({name for name, _digest, _size in entries}) != len(entries):
+        return None
+    return sorted(entries)
+
+
+def render_thread_manifest(thread_names: dict[int, str]) -> str:
+    """Render immutable thread IDs and hashes of their captured names."""
+    lines = [f"<!-- source_thread_count={len(thread_names)} -->"]
+    lines.extend(
+        f"<!-- source_thread_id={thread_id} name_sha256={content_sha256(name)} -->"
+        for thread_id, name in sorted(thread_names.items())
+    )
+    return "\n".join(lines)
+
+
+def parse_thread_manifest(content: str) -> dict[int, str] | None:
+    """Parse one complete thread ID/name-hash manifest."""
+    count_matches = _THREAD_COUNT_RE.findall(content)
+    if len(count_matches) != 1:
+        return None
+    expected_count = int(count_matches[0])
+    entries = [(int(thread_id), digest) for thread_id, digest in _THREAD_MARKER_RE.findall(content)]
+    if len(entries) != expected_count or len({thread_id for thread_id, _digest in entries}) != len(entries):
+        return None
+    return dict(entries)
+
+
+def seal_canonical_content(content: str) -> str:
+    """Append a SHA-256 seal covering all canonical wikitext before the seal."""
+    if _CANONICAL_MARKER_RE.search(content):
+        raise ValueError("canonical content already contains an integrity seal")
+    base = content.rstrip("\n")
+    return f"{base}\n<!-- archive_canonical_sha256={content_sha256(base)} -->\n"
+
+
+def verify_canonical_content(content: str) -> bool:
+    """Verify the unique final seal while excluding only the seal itself."""
+    matches = list(_CANONICAL_MARKER_RE.finditer(content))
+    if len(matches) != 1:
+        return False
+    marker = matches[0]
+    if content[marker.end():] not in ("", "\n"):
+        return False
+    prefix = content[:marker.start()]
+    if not prefix.endswith("\n"):
+        return False
+    return content_sha256(prefix[:-1]) == marker.group(1)
 
 
 def sanitize_title_part(text: str) -> str:
@@ -317,6 +406,7 @@ def render_page(
     if part:
         lines.append("<!-- Archive part; deletion clearance is recorded on the canonical index page. -->")
     elif meta.get("complete", True):
+        lines.append(render_thread_manifest(meta.get("thread_names", {})))
         # A boundary per independently-read message stream prevents a later
         # thread snowflake from hiding a parent message that arrived mid-capture.
         for stream_id, boundary in sorted(meta.get("stream_boundaries", {}).items()):
@@ -330,7 +420,14 @@ def render_page(
     return "\n".join(lines)
 
 
-def split_messages(messages: list, channel_name: str, meta: dict, max_bytes: int = 1_800_000) -> list[list]:
+def split_messages(
+    messages: list,
+    channel_name: str,
+    meta: dict,
+    max_bytes: int = 1_800_000,
+    *,
+    page_title: str | None = None,
+) -> list[list]:
     """Partition messages so each rendered page stays below MediaWiki's byte limit.
 
     MediaWiki's article-size limit ($wgMaxArticleSize, default 2 MiB) counts UTF-8
@@ -350,22 +447,39 @@ def split_messages(messages: list, channel_name: str, meta: dict, max_bytes: int
         channel_name, [], part_meta, index=True, part=True
     ).encode("utf-8"))
 
-    def msg_cost(m) -> int:
-        rendered = render_page(channel_name, [m], part_meta, part=True)
+    base_title = page_title or make_page_title(channel_name)
+    def part_title(number: int) -> str:
+        return f"{base_title}/Part {number}"
+
+    def msg_cost(m, part_number: int) -> int:
+        # Always reserve a maximum-length cross-part target for a reply. Some
+        # replies will ultimately use a shorter same-page fragment, but never the
+        # reverse; the final rendered part can therefore only be smaller than this
+        # O(n) estimate. Six-digit part counts are far beyond Discord's capacity.
+        priced_index = None
+        reply_to = m.get("reply_to")
+        if reply_to:
+            priced_index = {reply_to: f"{base_title}/Part 999999"}
+        rendered = render_page(
+            channel_name, [m], part_meta, part=True,
+            anchor_index=priced_index, self_title=part_title(part_number),
+        )
         return max(1, len(rendered.encode("utf-8")) - overhead)
 
     chunks = []
     current = []
     current_size = 0
+    part_number = 1
     active_thread = None  # last thread_header seen, so continuations keep context
     for message in messages:
         if message.get("thread_header"):
             active_thread = message
-        cost = msg_cost(message)
+        cost = msg_cost(message, part_number)
         if current and overhead + current_size + cost > max_bytes:
             chunks.append(current)
             current = []
             current_size = 0
+            part_number += 1
             # If the split fell inside a thread, re-emit its heading so the
             # continuation part does not render thread replies as if they were
             # parent-channel messages (losing their source-thread attribution).
@@ -373,7 +487,15 @@ def split_messages(messages: list, channel_name: str, meta: dict, max_bytes: int
                 cont = dict(active_thread)
                 cont["thread_header"] = f"{active_thread['thread_header']} (continued)"
                 current.append(cont)
-                current_size += msg_cost(cont)
+                current_size += msg_cost(cont, part_number)
+            # Moving this reply to a new part can turn a short local fragment into
+            # a much longer cross-part target, so recompute after the split.
+            cost = msg_cost(message, part_number)
+        if overhead + current_size + cost > max_bytes:
+            raise ValueError(
+                f"one message plus its required thread/reply context exceeds the "
+                f"{max_bytes}-byte archive page limit"
+            )
         current.append(message)
         current_size += cost
     if current or not chunks:

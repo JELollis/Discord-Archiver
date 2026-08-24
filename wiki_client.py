@@ -298,6 +298,25 @@ class MediaWikiClient:
             "content": revision["slots"]["main"]["*"],
         }
 
+    async def get_file_info(self, filename: str) -> Optional[dict]:
+        """Return the current wiki file's SHA-1 and byte size, or ``None``."""
+        result = await self._authenticated_get({
+            "action": "query",
+            "prop": "imageinfo",
+            "iiprop": "sha1|size",
+            "titles": f"File:{filename}",
+        })
+        page = next(iter(result["query"]["pages"].values()))
+        imageinfo = page.get("imageinfo")
+        if "missing" in page or not imageinfo:
+            return None
+        current = imageinfo[0]
+        digest = current.get("sha1")
+        size = current.get("size")
+        if not digest or size is None:
+            return None
+        return {"sha1": digest.lower(), "size": int(size)}
+
     async def close(self) -> None:
         if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
