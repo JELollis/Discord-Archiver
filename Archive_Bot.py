@@ -859,6 +859,7 @@ class DeleteConfirmationView(discord.ui.View):
         self.requester_id = requester_id
         self.channels = channels
         self.categories = categories
+        self.processing = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Prevent anyone except the original requester from confirming/cancelling."""
@@ -876,12 +877,49 @@ class DeleteConfirmationView(discord.ui.View):
     @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Perform the confirmed deletion and report successes/failures."""
+        # Claim the operation before the first await. Component callbacks can be
+        # dispatched again while a slow archive re-verification is running, and
+        # merely disabling the in-memory button does not update Discord's copy.
+        already_processing = self.processing
+        self.processing = True
+        if already_processing:
+            await interaction.response.send_message(
+                "Deletion is already in progress. Please wait for the result.",
+                ephemeral=True,
+            )
+            return
+
         # Acknowledge immediately because a large category can take several seconds.
-        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            self.processing = False
+            raise
 
         # Disable the controls so the same deletion cannot be submitted twice.
         for child in self.children:
             child.disabled = True
+        button.label = "Deletion in progress…"
+        logging.info(
+            "Delete confirmation accepted from %s (%s): verifying %d channel(s) and %d category(s).",
+            interaction.user,
+            interaction.user.id,
+            len(self.channels),
+            len(self.categories),
+        )
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    "⏳ **Deletion in progress**\n"
+                    f"Re-verifying {len(self.channels)} channel(s), then deleting channels and categories. "
+                    "Large archived categories can take several minutes."
+                ),
+                view=self,
+            )
+        except Exception:
+            # The deletion remains safe and the deferred interaction can still be
+            # completed even if Discord rejects this best-effort progress update.
+            logging.exception("Could not update the /delete confirmation with progress status.")
 
         deleted_channels = []
         deleted_channel_ids = set()
