@@ -88,7 +88,9 @@ The bot reads two pieces of configuration; **neither is committed to the reposit
    MEDIAWIKI_ARCHIVE_NAMESPACE=Archive
    ```
 
-   The BotPassword is created in the wiki at `Special:BotPasswords` with grants for editing and uploading.
+   The BotPassword is created in the wiki at `Special:BotPasswords` with grants for editing, uploading, and
+   **High-volume (bot) access**. The underlying service account must also have the `noratelimit` right. Run
+   `/wiki_status` to verify the effective login retains it; the bot uses bounded backoff if it does not.
    If the wiki settings are absent, the bot still runs but the wiki commands are disabled.
 
 ## Running
@@ -112,6 +114,21 @@ identity provider, and databases are deployed separately using private operator 
 
 The wiki requires MediaWiki **1.43 LTS** with the **PluggableAuth** and **OpenID Connect** extensions, an
 `Archive` namespace, and uploads enabled.
+
+SQL source files are valid plain-text archive material. Keep MIME verification enabled and add this mapping to
+the wiki's `LocalSettings.php` so `.sql` attachments remain directly downloadable instead of using the bot's
+automatic ZIP fallback:
+
+```php
+$wgFileExtensions[] = 'sql';
+$wgHooks['MimeMagicInit'][] = static function ( $mime ) {
+    $mime->addExtraTypes( 'text/plain sql' );
+};
+```
+
+After changing `LocalSettings.php`, run `php -l` before reloading the web server. The bot also preserves banned
+or MIME-mismatched attachments inside a ZIP, so an unfamiliar file type cannot make an archive appear complete
+while silently dropping content.
 
 ## Security notes
 

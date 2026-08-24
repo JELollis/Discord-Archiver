@@ -297,7 +297,7 @@ MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # matches $wgMaxUploadSize on the wiki
 
 
 def _zip_bytes(inner_filename: str, data: bytes) -> bytes:
-    """Wrap one file in an in-memory .zip (for types the wiki bans, e.g. .exe/.msi)."""
+    """Wrap one file in an in-memory ZIP for safe archival fallback."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(inner_filename, data)
@@ -307,9 +307,10 @@ def _zip_bytes(inner_filename: str, data: bytes) -> bytes:
 async def archive_attachments(client: MediaWikiClient, channel_name: str, messages: list) -> int:
     """Upload each attachment to the wiki; annotate dicts with wiki_filename/error.
 
-    Files whose type the wiki bans (e.g. .exe/.msi installers) are re-uploaded
-    wrapped in a .zip instead of failing, so the content is preserved without
-    weakening MediaWiki's executable-upload protection.
+    Files whose type the wiki bans (e.g. .exe/.msi installers), or whose valid
+    extension MediaWiki cannot reconcile with its detected MIME type, are
+    re-uploaded inside a ZIP. This preserves the content without weakening
+    MediaWiki's upload verification.
     """
     uploaded = 0
     for m in messages:
@@ -329,9 +330,10 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
                     result = await client.upload_file(name, data, comment=f"Discord attachment from #{channel_name}")
                     att["wiki_filename"] = result.get("filename") or name
                 except WikiError as exc:
-                    if "filetype-banned" not in str(exc):
+                    if not exc.is_file_type_rejection:
                         raise
-                    # Wiki disallows this type: preserve it inside a .zip instead.
+                    # The wiki cannot safely accept this type directly; preserve it
+                    # inside a ZIP while leaving MIME/executable checks enabled.
                     zip_name = discord_export.sanitize_filename(f"{name}.zip")
                     uploaded_data = _zip_bytes(att["filename"], data)
                     result = await client.upload_file(
@@ -1635,11 +1637,13 @@ async def wiki_status(interaction: discord.Interaction):
         info = await client.userinfo()
         generator = await client.site_generator()
         rights = info.get("rights", [])
+        bypasses_rate_limits = "noratelimit" in rights
         await interaction.followup.send(
             f"✅ Connected to **{generator}**\n"
             f"Bot user: `{info.get('name')}` (groups: {', '.join(info.get('groups', [])) or 'none'})\n"
             f"Can edit: {'yes' if 'edit' in rights else '**NO**'} | "
             f"upload: {'yes' if 'upload' in rights else '**NO**'}\n"
+            f"Rate-limit bypass: {'yes' if bypasses_rate_limits else '**NO** — bounded backoff enabled'}\n"
             f"Archive namespace: `{WIKI_CONFIG['MEDIAWIKI_ARCHIVE_NAMESPACE']}`",
             ephemeral=True,
         )

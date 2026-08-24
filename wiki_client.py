@@ -23,8 +23,9 @@ round-trip entirely.
 
 from __future__ import annotations
 
-import os
+import asyncio
 import logging
+import os
 from typing import Optional
 
 import aiohttp
@@ -34,9 +35,44 @@ USER_AGENT = (
     "(+https://gtc-wiki.completeelectronics.net; archive publisher)"
 )
 
+_MAX_REQUEST_ATTEMPTS = 4
+_TRANSPORT_RETRY_DELAYS = (1.0, 2.0, 4.0)
+# A MediaWiki upload limit commonly uses a one-minute window. These waits total
+# 70 seconds, so a request that reaches the final attempt gets a clean window.
+_RATE_LIMIT_RETRY_DELAYS = (10.0, 20.0, 40.0)
+_RETRYABLE_API_CODES = frozenset({"ratelimited", "maxlag", "readonly"})
+_RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 
 class WikiError(Exception):
     """Raised when the MediaWiki API returns an error or an unexpected result."""
+
+    def __init__(self, message: str, *, error: Optional[dict] = None):
+        super().__init__(message)
+        self.error = dict(error or {})
+
+    @property
+    def code(self) -> Optional[str]:
+        code = self.error.get("code")
+        return str(code) if code is not None else None
+
+    def has_detail(self, token: str) -> bool:
+        details = self.error.get("details", ())
+        if isinstance(details, (str, bytes)):
+            details = (details,)
+        return token in details
+
+    @property
+    def is_file_type_rejection(self) -> bool:
+        """Whether preserving the upload inside a ZIP is a safe fallback."""
+        return (
+            self.code == "filetype-banned"
+            or self.has_detail("filetype-mime-mismatch")
+            # Preserve compatibility with custom/older callers that only put the
+            # MediaWiki error token in the exception message.
+            or "filetype-banned" in str(self)
+            or "filetype-mime-mismatch" in str(self)
+        )
 
 
 def load_config(env: Optional[dict] = None) -> dict:
@@ -100,6 +136,9 @@ class MediaWikiClient:
         self._owns_session = session is None
         self._csrf: Optional[str] = None
         self.logged_in = False
+        # One authenticated bot account shares one rate-limit budget and one
+        # connection pool. Serializing requests also makes pool resets race-free.
+        self._request_lock = asyncio.Lock()
 
     @classmethod
     def from_config(cls, config: Optional[dict] = None) -> "MediaWikiClient":
@@ -120,28 +159,150 @@ class MediaWikiClient:
                 headers={"User-Agent": USER_AGENT}, timeout=timeout)
             self._owns_session = True
 
-    async def _get(self, params: dict) -> dict:
-        await self._ensure_session()
-        params.setdefault("format", "json")
-        async with self._session.get(self.api_url, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    async def _discard_owned_session(self) -> None:
+        """Drop a stale connection pool before a transport-level retry."""
+        if not self._owns_session or self._session is None:
+            return
+        session = self._session
+        self._session = None
+        if not session.closed:
+            await session.close()
 
-    async def _post(self, data: dict, *, files: Optional[dict] = None) -> dict:
+    async def _sleep_before_retry(self, delay: float) -> None:
+        """Test seam for retry delays."""
+        await asyncio.sleep(delay)
+
+    @staticmethod
+    def _retry_after_seconds(headers) -> Optional[float]:
+        if not headers:
+            return None
+        value = headers.get("Retry-After")
+        if value is None:
+            return None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return None
+
+    async def _request_once(
+        self,
+        method: str,
+        *,
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        files: Optional[dict] = None,
+    ) -> tuple[dict, Optional[float]]:
+        """Issue one request, rebuilding multipart data for every attempt."""
         await self._ensure_session()
-        data.setdefault("format", "json")
-        if files:
+        request_kwargs = {}
+        if params is not None:
+            request_kwargs["params"] = params
+        elif files:
             form = aiohttp.FormData()
-            for key, value in data.items():
+            for key, value in (data or {}).items():
                 form.add_field(key, str(value))
             for key, (filename, content, ctype) in files.items():
                 form.add_field(key, content, filename=filename, content_type=ctype)
-            payload = form
+            request_kwargs["data"] = form
         else:
-            payload = data
-        async with self._session.post(self.api_url, data=payload) as resp:
+            request_kwargs["data"] = data
+
+        async with self._session.request(
+            method, self.api_url, **request_kwargs
+        ) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            result = await resp.json()
+            return result, self._retry_after_seconds(resp.headers)
+
+    async def _request_json(
+        self,
+        method: str,
+        *,
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        files: Optional[dict] = None,
+    ) -> dict:
+        async with self._request_lock:
+            return await self._request_json_with_retries(
+                method, params=params, data=data, files=files
+            )
+
+    async def _request_json_with_retries(
+        self,
+        method: str,
+        *,
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        files: Optional[dict] = None,
+    ) -> dict:
+        """Request JSON with bounded retries for transient wiki/network failures."""
+        action_data = params if params is not None else data
+        action = (action_data or {}).get("action", "request")
+
+        for attempt in range(_MAX_REQUEST_ATTEMPTS):
+            retry_after = None
+            try:
+                result, retry_after = await self._request_once(
+                    method, params=params, data=data, files=files
+                )
+            except aiohttp.ContentTypeError as exc:
+                # Cloudflare/proxies occasionally return an HTML response with 200.
+                retryable_exc = exc
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                aiohttp.ServerTimeoutError,
+                asyncio.TimeoutError,
+            ) as exc:
+                retryable_exc = exc
+            except aiohttp.ClientResponseError as exc:
+                if exc.status not in _RETRYABLE_HTTP_STATUSES:
+                    raise
+                retryable_exc = exc
+                retry_after = self._retry_after_seconds(exc.headers)
+            else:
+                error = result.get("error") if isinstance(result, dict) else None
+                code = str(error.get("code", "")) if isinstance(error, dict) else ""
+                if code not in _RETRYABLE_API_CODES or attempt == _MAX_REQUEST_ATTEMPTS - 1:
+                    return result
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else _RATE_LIMIT_RETRY_DELAYS[attempt]
+                )
+                logging.warning(
+                    "MediaWiki %s returned %s; retrying in %.1fs (attempt %d/%d)",
+                    action, code, delay, attempt + 2, _MAX_REQUEST_ATTEMPTS,
+                )
+                await self._sleep_before_retry(delay)
+                continue
+
+            if attempt == _MAX_REQUEST_ATTEMPTS - 1:
+                raise retryable_exc
+            await self._discard_owned_session()
+            delay = (
+                retry_after
+                if retry_after is not None
+                else _TRANSPORT_RETRY_DELAYS[attempt]
+            )
+            logging.warning(
+                "MediaWiki %s transport failure (%s); retrying in %.1fs (attempt %d/%d)",
+                action, type(retryable_exc).__name__, delay,
+                attempt + 2, _MAX_REQUEST_ATTEMPTS,
+            )
+            await self._sleep_before_retry(delay)
+
+        raise AssertionError("unreachable MediaWiki retry state")
+
+    async def _get(self, params: dict) -> dict:
+        payload = dict(params)
+        payload.setdefault("format", "json")
+        return await self._request_json("GET", params=payload)
+
+    async def _post(self, data: dict, *, files: Optional[dict] = None) -> dict:
+        payload = dict(data)
+        payload.setdefault("format", "json")
+        return await self._request_json("POST", data=payload, files=files)
 
     async def login(self) -> dict:
         """Authenticate with the BotPassword and cache a CSRF token."""
@@ -177,7 +338,7 @@ class MediaWikiClient:
                 "badtoken", "notloggedin", "not logged in", "assertuserfailed",
                 "readapidenied", "permissiondenied",
             )
-            if not any(token in message for token in auth_errors):
+            if exc.code not in auth_errors and not any(token in message for token in auth_errors):
                 raise
             self._csrf = None
             self.logged_in = False
@@ -192,14 +353,16 @@ class MediaWikiClient:
         async def submit():
             result = await self._get(params)
             if "error" in result:
-                raise WikiError(f"MediaWiki query failed: {result['error']}")
+                error = result["error"]
+                raise WikiError(f"MediaWiki query failed: {error}", error=error)
             return result
 
         return await self._retry_after_auth_error(submit)
 
     async def userinfo(self) -> dict:
         return (await self._authenticated_get({
-            "action": "query", "meta": "userinfo", "uiprop": "groups|rights",
+            "action": "query", "meta": "userinfo",
+            "uiprop": "groups|rights|ratelimits",
         }))["query"]["userinfo"]
 
     async def site_generator(self) -> str:
@@ -236,7 +399,8 @@ class MediaWikiClient:
             data["token"] = self._csrf
             result = await self._post(data)
             if "error" in result:
-                raise WikiError(f"edit {title!r} failed: {result['error']}")
+                error = result["error"]
+                raise WikiError(f"edit {title!r} failed: {error}", error=error)
             return result
         return (await self._retry_after_auth_error(submit))["edit"]
 
@@ -275,7 +439,7 @@ class MediaWikiClient:
                             "duplicate": True,
                         }
                     }
-                raise WikiError(f"upload {filename!r} failed: {result['error']}")
+                raise WikiError(f"upload {filename!r} failed: {error}", error=error)
             return result
         return (await self._retry_after_auth_error(submit))["upload"]
 

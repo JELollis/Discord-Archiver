@@ -9,9 +9,24 @@ import unittest
 try:
     import aiohttp  # noqa: F401
 except ModuleNotFoundError:
-    sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+    aiohttp = types.ModuleType("aiohttp")
 
-from wiki_client import MediaWikiClient
+    class _ClientError(Exception):
+        pass
+
+    class _ClientResponseError(_ClientError):
+        status = 0
+        headers = None
+
+    aiohttp.ClientConnectionError = _ClientError
+    aiohttp.ClientPayloadError = _ClientError
+    aiohttp.ServerTimeoutError = _ClientError
+    aiohttp.ServerDisconnectedError = _ClientError
+    aiohttp.ClientResponseError = _ClientResponseError
+    aiohttp.ContentTypeError = _ClientResponseError
+    sys.modules["aiohttp"] = aiohttp
+
+from wiki_client import MediaWikiClient, WikiError
 
 
 class ExpiredReadClient(MediaWikiClient):
@@ -20,6 +35,7 @@ class ExpiredReadClient(MediaWikiClient):
         self.logged_in = True
         self.login_calls = 0
         self.query_calls = 0
+        self.last_params = None
 
     async def login(self):
         self.login_calls += 1
@@ -29,6 +45,7 @@ class ExpiredReadClient(MediaWikiClient):
 
     async def _get(self, params):
         self.query_calls += 1
+        self.last_params = dict(params)
         if self.query_calls == 1:
             return {"error": {"code": "readapidenied", "info": "session expired"}}
         return {"query": {"userinfo": {"name": "bot"}}}
@@ -63,6 +80,35 @@ class FileInfoClient(MediaWikiClient):
         }]}}}}
 
 
+class RetryingClient(MediaWikiClient):
+    def __init__(self, outcomes):
+        super().__init__("https://wiki.invalid/api.php", "bot", "secret")
+        self.logged_in = True
+        self._csrf = "csrf"
+        self.outcomes = list(outcomes)
+        self.calls = []
+        self.delays = []
+        self.discard_calls = 0
+
+    async def _request_once(self, method, *, params=None, data=None, files=None):
+        self.calls.append({
+            "method": method,
+            "params": params,
+            "data": data,
+            "files": files,
+        })
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    async def _sleep_before_retry(self, delay):
+        self.delays.append(delay)
+
+    async def _discard_owned_session(self):
+        self.discard_calls += 1
+
+
 class WikiClientTests(unittest.TestCase):
     def test_private_read_reauthenticates_once_after_session_expiry(self):
         client = ExpiredReadClient()
@@ -70,6 +116,7 @@ class WikiClientTests(unittest.TestCase):
         self.assertEqual(result["name"], "bot")
         self.assertEqual(client.login_calls, 1)
         self.assertEqual(client.query_calls, 2)
+        self.assertEqual(client.last_params["uiprop"], "groups|rights|ratelimits")
 
     def test_edit_can_atomically_guard_existing_or_new_pages(self):
         client = CapturingEditClient()
@@ -95,6 +142,70 @@ class WikiClientTests(unittest.TestCase):
         self.assertEqual(client.params["titles"], "File:archive.png")
         self.assertEqual(client.params["iiprop"], "sha1|size")
         self.assertIsNone(asyncio.run(FileInfoClient(missing=True).get_file_info("gone.png")))
+
+    def test_upload_retries_rate_limit_through_full_window(self):
+        limited = ({
+            "error": {
+                "code": "ratelimited",
+                "info": "Please wait and try again",
+            }
+        }, None)
+        success = ({
+            "upload": {"result": "Success", "filename": "archive.png"}
+        }, None)
+        client = RetryingClient([limited, limited, limited, success])
+
+        result = asyncio.run(client.upload_file("archive.png", b"content"))
+
+        self.assertEqual(result["filename"], "archive.png")
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(client.delays, [10.0, 20.0, 40.0])
+        self.assertTrue(all(call["files"] for call in client.calls))
+
+    def test_upload_stops_after_bounded_rate_limit_retries(self):
+        limited = ({
+            "error": {
+                "code": "ratelimited",
+                "info": "Please wait and try again",
+            }
+        }, None)
+        client = RetryingClient([limited, limited, limited, limited])
+
+        with self.assertRaises(WikiError) as raised:
+            asyncio.run(client.upload_file("archive.png", b"content"))
+
+        self.assertEqual(raised.exception.code, "ratelimited")
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(client.delays, [10.0, 20.0, 40.0])
+
+    def test_edit_retries_transient_disconnect_with_fresh_request(self):
+        disconnected = aiohttp.ServerDisconnectedError()
+        success = ({"edit": {"result": "Success", "newrevid": 43}}, None)
+        client = RetryingClient([disconnected, success])
+
+        result = asyncio.run(client.edit_page("Archive:Test", "text", "summary"))
+
+        self.assertEqual(result["newrevid"], 43)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.delays, [1.0])
+        self.assertEqual(client.discard_calls, 1)
+
+    def test_mime_mismatch_remains_structured_for_zip_fallback(self):
+        failure = ({
+            "error": {
+                "code": "verification-error",
+                "info": "extension does not match text/plain",
+                "details": ["filetype-mime-mismatch", "sql", "text/plain"],
+            }
+        }, None)
+        client = RetryingClient([failure])
+
+        with self.assertRaises(WikiError) as raised:
+            asyncio.run(client.upload_file("schema.sql", b"SELECT 1;"))
+
+        self.assertEqual(raised.exception.code, "verification-error")
+        self.assertTrue(raised.exception.has_detail("filetype-mime-mismatch"))
+        self.assertTrue(raised.exception.is_file_type_rejection)
 
 
 if __name__ == "__main__":
