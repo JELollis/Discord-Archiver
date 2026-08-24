@@ -94,10 +94,25 @@ def resolve_mentions(text: str, guild, *, members=None, channels=None, roles=Non
 _TITLE_BAD = re.compile(r"[#<>\[\]|{}/:]+")
 
 
+def _truncate_bytes(text: str, max_bytes: int) -> str:
+    """Truncate to at most max_bytes of UTF-8 without splitting a codepoint."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", "ignore")
+
+
 def sanitize_title_part(text: str) -> str:
-    """Make a string safe as a MediaWiki title component."""
+    """Make a string safe as a MediaWiki title component.
+
+    MediaWiki caps a full page title at 255 UTF-8 bytes, so bound the component
+    by encoded byte length (a name of many emoji/CJK characters can be well under
+    255 characters yet exceed the byte limit). 200 bytes leaves room for the
+    ``Archive:Misc/`` prefix and any ``/Part N`` suffix.
+    """
     text = _TITLE_BAD.sub("-", text).strip().strip("-")
-    return re.sub(r"\s+", "_", text) or "unnamed"
+    text = re.sub(r"\s+", "_", text) or "unnamed"
+    return _truncate_bytes(text, 200).strip("-_") or "unnamed"
 
 
 def sanitize_filename(name: str) -> str:
@@ -257,16 +272,41 @@ def split_messages(messages: list, channel_name: str, meta: dict, max_bytes: int
     bytes, so measure the encoded byte length (multibyte emoji/names count for more
     than one character).
     """
+    # Measure each message's rendered byte cost once (O(n) total) instead of
+    # re-rendering the whole growing chunk every iteration (which was O(n^2) and
+    # could stall /publish on very active channels). The per-message cost is the
+    # rendered page size minus the fixed header/footer overhead; summing these
+    # slightly overestimates a chunk (per-message blank lines are counted once
+    # each), which only makes splitting more conservative — always safe.
+    part_meta = {**meta, "complete": False}
+    overhead = len(render_page(channel_name, [], part_meta).encode("utf-8"))
+
+    def msg_cost(m) -> int:
+        rendered = render_page(channel_name, [m], part_meta)
+        return max(1, len(rendered.encode("utf-8")) - overhead)
+
     chunks = []
     current = []
+    current_size = 0
+    active_thread = None  # last thread_header seen, so continuations keep context
     for message in messages:
-        candidate = current + [message]
-        rendered = render_page(channel_name, candidate, {**meta, "complete": False})
-        if current and len(rendered.encode("utf-8")) > max_bytes:
+        if message.get("thread_header"):
+            active_thread = message
+        cost = msg_cost(message)
+        if current and overhead + current_size + cost > max_bytes:
             chunks.append(current)
-            current = [message]
-        else:
-            current = candidate
+            current = []
+            current_size = 0
+            # If the split fell inside a thread, re-emit its heading so the
+            # continuation part does not render thread replies as if they were
+            # parent-channel messages (losing their source-thread attribution).
+            if active_thread is not None and not message.get("thread_header"):
+                cont = dict(active_thread)
+                cont["thread_header"] = f"{active_thread['thread_header']} (continued)"
+                current.append(cont)
+                current_size += msg_cost(cont)
+        current.append(message)
+        current_size += cost
     if current or not chunks:
         chunks.append(current)
     return chunks

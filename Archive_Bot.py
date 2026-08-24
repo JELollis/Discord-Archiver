@@ -126,6 +126,14 @@ def _archive_marker_re(channel_id: int) -> re.Pattern:
     )
 
 
+# Ownership marker with the channel id as a capture group, for reading which
+# channel a page belongs to. Anchored on the full generated comment so a message
+# merely quoting "source_channel_id=..." cannot be mistaken for page ownership.
+_OWNER_MARKER_RE = re.compile(
+    r"<!-- source_channel_id=(\d+) captured_at=[^\n]*? captured_until=\d+ -->"
+)
+
+
 async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     """Read a channel's full history AND all its threads (oldest first).
 
@@ -637,6 +645,7 @@ class DeleteConfirmationView(discord.ui.View):
             child.disabled = True
 
         deleted_channels = []
+        deleted_channel_ids = set()
         deleted_categories = []
         failures = []
 
@@ -673,6 +682,7 @@ class DeleteConfirmationView(discord.ui.View):
             try:
                 await channel.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
                 deleted_channels.append(channel.name)
+                deleted_channel_ids.add(channel.id)
                 logging.info("Channel '%s' (%s) deleted by %s (%s).", channel.name, channel.id, interaction.user, interaction.user.id)
             except Exception as e:
                 failures.append(f"channel `{channel.name}`: {e}")
@@ -680,6 +690,17 @@ class DeleteConfirmationView(discord.ui.View):
 
         # Categories are removed after all selected child channels have been attempted.
         for category in self.categories:
+            # Deleting a category leaves its remaining channels uncategorised rather
+            # than deleting them. If any selected child was skipped or failed above,
+            # keep the category so that surviving child is not silently moved out of
+            # it — honouring the "no selected children left behind" guarantee.
+            surviving = [c for c in self.channels
+                         if getattr(c, "category_id", None) == category.id and c.id not in deleted_channel_ids]
+            if surviving:
+                failures.append(
+                    f"category `{category.name}`: kept — {len(surviving)} selected child channel(s) were not deleted")
+                logging.warning("Kept category '%s' (%s): %d selected child(ren) not deleted.", category.name, category.id, len(surviving))
+                continue
             try:
                 await category.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
                 deleted_categories.append(category.name)
@@ -979,7 +1000,10 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     title = discord_export.make_page_title(channel.name, namespace)
     existing = await client.get_page(title)
     if existing:
-        other = re.search(r"source_channel_id=(\d+)", existing["content"])
+        # Read ownership only from the generated marker, not any "source_channel_id="
+        # substring an archived message might contain, so a user message can't make
+        # the bot believe its own page belongs to another channel.
+        other = _OWNER_MARKER_RE.search(existing["content"])
         if other and int(other.group(1)) != channel.id:
             raise WikiError(f"archive page {title!r} belongs to another Discord channel")
     captured_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
