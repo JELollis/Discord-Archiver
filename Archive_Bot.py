@@ -12,6 +12,11 @@ import re
 
 from wiki_client import MediaWikiClient, WikiError, load_config
 import discord_export
+from discord_rate_limit import (
+    AsyncActionPacer,
+    MIN_DISCORD_ACTION_INTERVAL_SECONDS,
+    build_discord_http_trace,
+)
 
 # Setup logging
 log_directory = "logs"
@@ -31,8 +36,14 @@ with open("Bot Key.txt", "r", encoding="utf-8") as key_file:
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    http_trace=build_discord_http_trace(),
+)
 tree = bot.tree
+
+_delete_discord_pacer = AsyncActionPacer(MIN_DISCORD_ACTION_INTERVAL_SECONDS)
 
 # ---- MediaWiki archive publishing (lazy client; created + logged in on first use) ----
 try:
@@ -135,6 +146,76 @@ async def _iter_threads(channel):
             if th.id not in seen:
                 seen.add(th.id)
                 yield th
+
+
+async def _collect_history_page(stream, limit: int, before):
+    return [
+        message
+        async for message in stream.history(
+            limit=limit,
+            before=before,
+            oldest_first=False,
+        )
+    ]
+
+
+async def _iter_paced_history(stream, label: str, *, limit: int | None = None):
+    """Yield history in explicit pages with five seconds between REST requests."""
+    before = None
+    remaining = limit
+    while remaining is None or remaining > 0:
+        page_limit = 100 if remaining is None else min(100, remaining)
+        page = await _delete_discord_pacer.run(
+            f"read {label} history",
+            lambda page_limit=page_limit, before=before: _collect_history_page(
+                stream, page_limit, before),
+        )
+        if not page:
+            return
+        for message in page:
+            yield message
+        if remaining is not None:
+            remaining -= len(page)
+        if len(page) < page_limit:
+            return
+        before = page[-1]
+
+
+async def _collect_archived_thread_page(channel, private: bool, before):
+    return [
+        thread
+        async for thread in channel.archived_threads(
+            private=private,
+            limit=100,
+            before=before,
+        )
+    ]
+
+
+async def _iter_paced_threads(channel):
+    """Yield active and archived threads with paced archived-thread pages."""
+    seen = set()
+    for thread in list(getattr(channel, "threads", [])):
+        if thread.id not in seen:
+            seen.add(thread.id)
+            yield thread
+    for private in (False, True):
+        before = None
+        while True:
+            page = await _delete_discord_pacer.run(
+                f"list {'private' if private else 'public'} archived threads for #{channel.name}",
+                lambda private=private, before=before: _collect_archived_thread_page(
+                    channel, private, before),
+            )
+            if not page:
+                break
+            for thread in page:
+                if thread.id not in seen:
+                    seen.add(thread.id)
+                    yield thread
+            if len(page) < 100:
+                break
+            before = page[-1]
 
 
 def _archive_marker_re(channel_id: int) -> re.Pattern:
@@ -379,7 +460,11 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
             history = getattr(channel, "history", None)
             if history is None:
                 return False
-            async for _message in history(limit=1, oldest_first=False):
+            async for _message in _iter_paced_history(
+                channel,
+                f"#{channel.name}",
+                limit=1,
+            ):
                 return False
             return True
         except Exception as exc:
@@ -465,11 +550,14 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
         return check()
 
     try:
-        if not await _stream_current(channel.id, channel.history(limit=None, oldest_first=False)):
+        if not await _stream_current(
+            channel.id,
+            _iter_paced_history(channel, f"#{channel.name}"),
+        ):
             return False
         # Every thread (active + archived) must also be captured and unedited; a
         # failure to list or read threads blocks deletion (contents unprovable).
-        threads = [thread async for thread in _iter_threads(channel)]
+        threads = [thread async for thread in _iter_paced_threads(channel)]
         current_threads = {
             thread.id: discord_export.content_sha256(thread.name)
             for thread in threads
@@ -478,7 +566,10 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
             logging.warning("Thread set or names changed for #%s; blocking deletion.", channel.name)
             return False
         for thread in threads:
-            if not await _stream_current(thread.id, thread.history(limit=None, oldest_first=False)):
+            if not await _stream_current(
+                thread.id,
+                _iter_paced_history(thread, f"thread {thread.name} in #{channel.name}"),
+            ):
                 return False
     except Exception as exc:
         logging.warning("Content verification failed for #%s; blocking deletion: %s", channel.name, exc)
@@ -977,7 +1068,11 @@ class DeleteConfirmationView(discord.ui.View):
                 logging.warning("Skipped deleting #%s (%s): archive stale/unverified at confirm time.", channel.name, channel.id)
                 continue
             try:
-                await channel.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
+                await _delete_discord_pacer.run(
+                    f"delete channel #{channel.name}",
+                    lambda channel=channel: channel.delete(
+                        reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})"),
+                )
                 deleted_channels.append(channel.name)
                 deleted_channel_ids.add(channel.id)
                 logging.info("Channel '%s' (%s) deleted by %s (%s).", channel.name, channel.id, interaction.user, interaction.user.id)
@@ -1002,7 +1097,11 @@ class DeleteConfirmationView(discord.ui.View):
                 logging.warning("Kept category '%s' (%s): %d selected child(ren) not deleted.", category.name, category.id, len(surviving))
                 continue
             try:
-                await category.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
+                await _delete_discord_pacer.run(
+                    f"delete category {category.name}",
+                    lambda category=category: category.delete(
+                        reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})"),
+                )
                 deleted_categories.append(category.name)
                 logging.info("Category '%s' (%s) deleted by %s (%s).", category.name, category.id, interaction.user, interaction.user.id)
             except Exception as e:

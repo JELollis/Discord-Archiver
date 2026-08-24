@@ -65,6 +65,9 @@ Command parameters and safety behavior are also available through the bot's `/he
 
 The required retirement workflow is `/archive` → `/publish` → `/delete`. `/publish` refuses writable
 channels, and `/delete` revalidates the parent channel and every thread immediately before removal.
+Discord REST reads and deletions performed by `/delete` are globally serialized with at least five seconds
+between requests. If Discord returns HTTP 429, the bot honors the documented `Retry-After` value with a
+five-second minimum; a longer server-provided reset window always takes precedence.
 
 ## Wiki page structure
 
