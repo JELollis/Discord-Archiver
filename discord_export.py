@@ -14,6 +14,7 @@ let replies and external links target an exact message.
 from __future__ import annotations
 
 import re
+import hashlib
 from datetime import timezone
 
 # Discord entity references embedded in message content.
@@ -99,6 +100,8 @@ def resolve_mentions(text: str, guild, *, members=None, channels=None, roles=Non
 
 # Characters MediaWiki forbids in titles / that break File names.
 _TITLE_BAD = re.compile(r"[#<>\[\]|{}/:]+")
+_PART_COUNT_RE = re.compile(r"<!-- archive_part_count=(\d+) -->")
+_PART_MARKER_RE = re.compile(r"<!-- archive_part=(\d+) sha256=([0-9a-f]{64}) -->")
 
 
 def _truncate_bytes(text: str, max_bytes: int) -> str:
@@ -107,6 +110,36 @@ def _truncate_bytes(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
     return encoded[:max_bytes].decode("utf-8", "ignore")
+
+
+def content_sha256(text: str) -> str:
+    """Return the stable UTF-8 SHA-256 used by split archive manifests."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def render_part_manifest(manifest: list[tuple[int, str]]) -> str:
+    """Render the canonical page's expected split-part content hashes."""
+    lines = [f"<!-- archive_part_count={len(manifest)} -->"]
+    lines.extend(
+        f"<!-- archive_part={part_number} sha256={digest} -->"
+        for part_number, digest in manifest
+    )
+    return "\n".join(lines)
+
+
+def parse_part_manifest(content: str) -> list[tuple[int, str]] | None:
+    """Parse and validate one complete, contiguous generated part manifest."""
+    count_matches = _PART_COUNT_RE.findall(content)
+    if len(count_matches) != 1:
+        return None
+    expected_count = int(count_matches[0])
+    entries = [(int(number), digest) for number, digest in _PART_MARKER_RE.findall(content)]
+    if len(entries) != expected_count:
+        return None
+    entries.sort()
+    if [number for number, _digest in entries] != list(range(1, expected_count + 1)):
+        return None
+    return entries
 
 
 def sanitize_title_part(text: str) -> str:
@@ -163,7 +196,9 @@ def make_page_title(channel_name: str, namespace: str = "Archive") -> str:
 
 def attachment_upload_name(channel_name: str, message_id: int, attachment_id: int, filename: str) -> str:
     """Deterministic, collision-resistant upload filename for an attachment."""
-    return sanitize_filename(f"{channel_name}-{message_id}-{attachment_id}-{filename}")
+    # Keep immutable ids at the beginning so byte truncation can never remove
+    # them when a long multibyte channel/original filename consumes the budget.
+    return sanitize_filename(f"{message_id}-{attachment_id}-{channel_name}-{filename}")
 
 
 _IMAGE_EXT = {"png", "gif", "jpg", "jpeg", "webp"}

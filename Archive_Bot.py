@@ -200,6 +200,45 @@ def _parse_capture_time(value: str) -> datetime.datetime:
     raise ValueError(f"unsupported capture timestamp: {value!r}")
 
 
+def _page_owner_id(content: str) -> int | None:
+    """Return the generated owner id, including legacy complete pages."""
+    marker = _OWNER_MARKER_RE.search(content) or _LEGACY_OWNER_MARKER_RE.search(content)
+    return int(marker.group(1)) if marker else None
+
+
+async def _require_owned_or_missing_page(
+    client: MediaWikiClient, title: str, channel_id: int
+) -> dict | None:
+    """Refuse to overwrite an existing page unless this channel owns it."""
+    page = await client.get_page(title)
+    if page is None:
+        return None
+    owner_id = _page_owner_id(page["content"])
+    if owner_id is None:
+        raise WikiError(
+            f"archive page {title!r} already exists without a bot ownership marker; refusing to overwrite it")
+    if owner_id != channel_id:
+        raise WikiError(f"archive page {title!r} belongs to another Discord channel")
+    return page
+
+
+async def _archive_parts_match(
+    client: MediaWikiClient,
+    title: str,
+    channel_id: int,
+    manifest: list[tuple[int, str]],
+) -> bool:
+    """Verify every expected split part still exists, is owned, and hashes identically."""
+    for part_number, expected_digest in manifest:
+        page = await client.get_page(f"{title}/Part {part_number}")
+        if page is None or _page_owner_id(page["content"]) != channel_id:
+            return False
+        actual_digest = discord_export.content_sha256(page["content"])
+        if actual_digest != expected_digest:
+            return False
+    return True
+
+
 async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     """Read a channel's full history AND all its threads (oldest first).
 
@@ -290,7 +329,7 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
     return uploaded
 
 
-async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
+async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
     """True if a verified archive page for this channel exists on the wiki.
 
     Voice/stage channels are exempt only after their persistent text chat is
@@ -313,6 +352,8 @@ async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
             return False
     if not isinstance(channel, discord.TextChannel):
         return False
+    if client is None:
+        return False
     title = discord_export.make_page_title(channel.name, WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"])
     page = await client.get_page(title)
     if not page:
@@ -331,6 +372,17 @@ async def is_channel_archived(client: MediaWikiClient, channel) -> bool:
     # ambiguous. Older archives without per-stream markers must be republished.
     if len(stream_pairs) != len(stream_boundaries) or channel.id not in stream_boundaries:
         logging.warning("Missing or ambiguous stream boundaries for #%s; blocking deletion.", channel.name)
+        return False
+    part_manifest = discord_export.parse_part_manifest(page["content"])
+    if part_manifest is None:
+        logging.warning("Missing or ambiguous part manifest for #%s; blocking deletion.", channel.name)
+        return False
+    try:
+        if not await _archive_parts_match(client, title, channel.id, part_manifest):
+            logging.warning("Split archive parts changed or are missing for #%s; blocking deletion.", channel.name)
+            return False
+    except Exception as exc:
+        logging.warning("Could not verify split archive parts for #%s: %s", channel.name, exc)
         return False
     # Keep enforcing the operator workflow at deletion time as an additional
     # safety layer; per-stream boundaries below cover admin/webhook bypasses.
@@ -416,17 +468,28 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
             logging.error("Verified role not found.")
             return
 
-        # Create the archive category if it doesn't exist
+        archive_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                read_messages=False, send_messages=False,
+                send_messages_in_threads=False,
+            ),
+            verified_role: discord.PermissionOverwrite(
+                read_messages=True, send_messages=False,
+                send_messages_in_threads=False, read_message_history=True,
+            ),
+        }
+        if guild.me is not None:
+            archive_overwrites[guild.me] = discord.PermissionOverwrite(
+                read_messages=True, read_message_history=True,
+                send_messages=False, send_messages_in_threads=False,
+            )
+
+        # Create the category with its complete permission map in one request.
         archive_category = discord.utils.get(guild.categories, name=archive_category_name)
         if not archive_category:
-            archive_category = await guild.create_category(archive_category_name)
-            await archive_category.set_permissions(
-                guild.default_role, read_messages=False, send_messages=False,
-                send_messages_in_threads=False,
-            )
-            await archive_category.set_permissions(
-                verified_role, read_messages=True, send_messages=False,
-                send_messages_in_threads=False, read_message_history=True,
+            archive_category = await guild.create_category(
+                archive_category_name, overwrites=archive_overwrites,
+                reason=f"Archive category requested by {interaction.user} ({interaction.user.id})",
             )
             logging.info("Archive category '%s' created.", archive_category_name)
 
@@ -435,27 +498,13 @@ async def archive(interaction: discord.Interaction, term: str, year: int):
         for channel in guild.text_channels:
             logging.debug("Checking channel: %s", channel.name)
             if f"-{term}-{year}" in channel.name.lower():
-                await channel.edit(category=archive_category)
-
-                # Clear all existing permissions
-                for target in list(channel.overwrites.keys()):
-                    await channel.set_permissions(target, overwrite=None)
-
-                # Apply archive-specific permissions. Keep the bot able to
-                # read the channel even when it is not assigned Verified.
-                await channel.set_permissions(
-                    guild.default_role, read_messages=False, send_messages=False,
-                    send_messages_in_threads=False,
+                # Moving and replacing the full overwrite map in one PATCH avoids
+                # a transient exposure (or a half-cleared state after an API error).
+                await channel.edit(
+                    category=archive_category,
+                    overwrites=archive_overwrites,
+                    reason=f"Channel archived by {interaction.user} ({interaction.user.id})",
                 )
-                await channel.set_permissions(
-                    verified_role, read_messages=True, send_messages=False,
-                    send_messages_in_threads=False, read_message_history=True,
-                )
-                if guild.me is not None:
-                    await channel.set_permissions(
-                        guild.me, read_messages=True, read_message_history=True,
-                        send_messages=False, send_messages_in_threads=False,
-                    )
                 moved_channels.append(channel.name)
                 logging.info("Channel '%s' moved to archive and permissions updated.", channel.name)
 
@@ -778,15 +827,12 @@ class DeleteConfirmationView(discord.ui.View):
         # 60s ago; a member could have posted a new parent message or thread reply
         # since, making the archive stale. Re-check each message-bearing channel
         # immediately before deleting it so no uncaptured content is lost.
-        to_verify = [
+        wiki_targets = [
             c for c in self.channels
-            if isinstance(c, (
-                discord.TextChannel, discord.ForumChannel,
-                discord.VoiceChannel, discord.StageChannel,
-            ))
+            if isinstance(c, (discord.TextChannel, discord.ForumChannel))
         ]
         verify_client = None
-        if to_verify:
+        if wiki_targets:
             try:
                 verify_client = await get_wiki_client()
             except Exception as exc:
@@ -803,16 +849,30 @@ class DeleteConfirmationView(discord.ui.View):
         for channel in self.channels:
             if verify_client is not None and isinstance(channel, (
                 discord.TextChannel, discord.ForumChannel,
-                discord.VoiceChannel, discord.StageChannel,
             )):
-                try:
-                    still_archived = await is_channel_archived(verify_client, channel)
-                except Exception:
-                    still_archived = False
-                if not still_archived:
-                    failures.append(f"channel `{channel.name}`: archive is stale or unverified since confirmation — re-run `/publish` (not deleted)")
-                    logging.warning("Skipped deleting #%s (%s): archive stale/unverified at confirm time.", channel.name, channel.id)
-                    continue
+                archive_client = verify_client
+            elif isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                archive_client = None
+            else:
+                archive_client = None
+                still_archived = True
+            try:
+                if isinstance(channel, (
+                    discord.TextChannel, discord.ForumChannel,
+                    discord.VoiceChannel, discord.StageChannel,
+                )):
+                    still_archived = await is_channel_archived(archive_client, channel)
+            except Exception:
+                still_archived = False
+            if not still_archived:
+                remedy = (
+                    "persistent text chat is not empty/unverifiable"
+                    if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+                    else "archive is stale or unverified — re-run /publish"
+                )
+                failures.append(f"channel `{channel.name}`: {remedy} (not deleted)")
+                logging.warning("Skipped deleting #%s (%s): archive stale/unverified at confirm time.", channel.name, channel.id)
+                continue
             try:
                 await channel.delete(reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})")
                 deleted_channels.append(channel.name)
@@ -947,28 +1007,38 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
     # Safety gate: text/forum channels require a verified archive. Voice/stage
     # channels must at least have empty persistent text chat; unsupported forums
     # remain blocked by is_channel_archived.
-    to_verify = [
+    voice_stage_targets = [
         ch for ch in matched_channels
-        if isinstance(ch, (
-            discord.TextChannel, discord.ForumChannel,
-            discord.VoiceChannel, discord.StageChannel,
-        ))
+        if isinstance(ch, (discord.VoiceChannel, discord.StageChannel))
     ]
-    if to_verify:
+    wiki_targets = [
+        ch for ch in matched_channels
+        if isinstance(ch, (discord.TextChannel, discord.ForumChannel))
+    ]
+    unarchived = [
+        ch for ch in voice_stage_targets
+        if not await is_channel_archived(None, ch)
+    ]
+    if wiki_targets:
         try:
             wiki = await get_wiki_client()
         except Exception as exc:
             await interaction.followup.send(
                 f"🛑 Cannot verify wiki archives ({exc}). Deletion blocked for safety.", ephemeral=True)
             return
-        unarchived = [ch.name for ch in to_verify if not await is_channel_archived(wiki, ch)]
-        if unarchived:
-            listing = ", ".join(f"`{n}`" for n in unarchived[:20])
-            more = "" if len(unarchived) <= 20 else f" (+{len(unarchived) - 20} more)"
-            await interaction.followup.send(
-                "🛑 Deletion blocked — these channels have no verified wiki archive yet:\n"
-                f"{listing}{more}\n\nRun `/publish` on each channel first.", ephemeral=True)
-            return
+        unarchived.extend(
+            ch for ch in wiki_targets
+            if not await is_channel_archived(wiki, ch)
+        )
+    if unarchived:
+        listing = ", ".join(f"`{ch.name}`" for ch in unarchived[:20])
+        more = "" if len(unarchived) <= 20 else f" (+{len(unarchived) - 20} more)"
+        await interaction.followup.send(
+            "🛑 Deletion blocked — these channels are not safely archived/empty:\n"
+            f"{listing}{more}\n\nPublish text channels first; voice/stage text chat must be empty, and forums are unsupported.",
+            ephemeral=True,
+        )
+        return
 
     # List categories and explicitly selected standalone channels separately;
     # child channels are represented by the total count to keep the prompt sane.
@@ -1168,18 +1238,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     uploaded = await archive_attachments(client, channel.name, messages)
     namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
     title = discord_export.make_page_title(channel.name, namespace)
-    existing = await client.get_page(title)
-    if existing:
-        # Read ownership only from the generated marker, not any "source_channel_id="
-        # substring an archived message might contain, so a user message can't make
-        # the bot believe its own page belongs to another channel.
-        other = (_OWNER_MARKER_RE.search(existing["content"])
-                 or _LEGACY_OWNER_MARKER_RE.search(existing["content"]))
-        if other is None:
-            raise WikiError(
-                f"archive page {title!r} already exists without a bot ownership marker; refusing to overwrite it")
-        if int(other.group(1)) != channel.id:
-            raise WikiError(f"archive page {title!r} belongs to another Discord channel")
+    canonical_page = await _require_owned_or_missing_page(client, title, channel.id)
     real_messages = [m for m in messages if not m.get("thread_header")]
     stream_boundaries = {channel.id: 0}
     for message in messages:
@@ -1216,6 +1275,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
             except WikiError as exc:
                 if "articleexists" not in str(exc).lower():
                     raise
+    part_manifest: list[tuple[int, str]] = []
     if len(parts) > 1:
         # Map each message id to the part page that holds it, so cross-part reply
         # links target the correct page instead of a dead same-page anchor.
@@ -1226,13 +1286,33 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
             for m in part
             if not m.get("thread_header")
         }
+        # Preflight every target before changing any part, so a collision on a
+        # later part cannot leave earlier parts partially overwritten.
+        existing_parts = {
+            part_title: await _require_owned_or_missing_page(client, part_title, channel.id)
+            for part_title in part_titles
+        }
         for idx, part in enumerate(parts, 1):
             part_title = part_titles[idx - 1]
+            existing_part = existing_parts[part_title]
             part_text = discord_export.render_page(
                 channel.name, part, {**meta, "complete": False},
                 part=True, anchor_index=anchor_index, self_title=part_title,
             )
-            await client.edit_page(part_title, part_text, f"Archive part {idx} for #{channel.name}")
+            part_edit = await client.edit_page(
+                part_title, part_text, f"Archive part {idx} for #{channel.name}",
+                createonly=existing_part is None,
+                baserevid=existing_part["revid"] if existing_part else None,
+            )
+            saved_part = await client.get_page(part_title)
+            if not (saved_part
+                    and _page_owner_id(saved_part["content"]) == channel.id
+                    and _edit_matches_readback(part_edit, saved_part)):
+                raise WikiError(f"archive part {idx} failed read-back verification")
+            part_manifest.append((
+                idx,
+                discord_export.content_sha256(saved_part["content"]),
+            ))
         links = "\n".join(f"* [[{pt}|Part {i}]]" for i, pt in enumerate(part_titles, 1))
         # index=True suppresses the "no messages" notice on the canonical index page.
         final_text = discord_export.render_page(channel.name, [], meta, index=True) + f"\n\n== Archive parts ==\n{links}\n"
@@ -1248,13 +1328,27 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
             channel.name, messages, {**meta, "complete": False},
             anchor_index=anchor_index, self_title=title,
         )
+    manifest_text = discord_export.render_part_manifest(part_manifest)
+    final_text = f"{final_text}\n{manifest_text}\n"
+    staged_text = f"{staged_text}\n{manifest_text}\n"
     edit = await client.edit_page(
-        title, staged_text, f"Stage archive #{channel.name} ({len(real_messages)} messages)"
+        title, staged_text, f"Stage archive #{channel.name} ({len(real_messages)} messages)",
+        createonly=canonical_page is None,
+        baserevid=canonical_page["revid"] if canonical_page else None,
     )
     page = await client.get_page(title)
     saved_owner = _OWNER_MARKER_RE.search(page["content"]) if page else None
     owner_present = bool(saved_owner and int(saved_owner.group(1)) == channel.id)
-    staged_verified = bool(owner_present and _edit_matches_readback(edit, page))
+    saved_manifest = discord_export.parse_part_manifest(page["content"] if page else "")
+    staged_parts_match = await _archive_parts_match(
+        client, title, channel.id, part_manifest
+    )
+    staged_verified = bool(
+        owner_present
+        and _edit_matches_readback(edit, page)
+        and saved_manifest == part_manifest
+        and staged_parts_match
+    )
     ready = bool(meta["complete"] and staged_verified)
     if not meta["complete"]:
         error = "capture or attachment archiving was incomplete"
@@ -1271,6 +1365,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "error": error,
         "_final_text": final_text if ready else None,
         "_stream_boundaries": stream_boundaries,
+        "_part_manifest": part_manifest,
     }
 
 
@@ -1278,11 +1373,17 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
     """Add deletion clearance after announcement and verify it from the wiki."""
     final_text = result.pop("_final_text", None)
     expected_streams = result.pop("_stream_boundaries", {})
+    expected_parts = result.pop("_part_manifest", [])
     if not final_text:
         raise WikiError("archive was not ready for finalisation")
+    if not await _archive_parts_match(
+        client, result["title"], result["channel"].id, expected_parts
+    ):
+        raise WikiError("archive parts changed before finalisation")
     edit = await client.edit_page(
         result["title"], final_text,
         f"Finalise announced archive #{result['channel'].name}",
+        baserevid=result.get("revid"),
     )
     page = await client.get_page(result["title"])
     marker_present = bool(
@@ -1296,10 +1397,16 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
         int(stream_id): int(boundary)
         for stream_id, boundary in _STREAM_MARKER_RE.findall(page["content"] if page else "")
     }
+    saved_parts = discord_export.parse_part_manifest(page["content"] if page else "")
+    parts_match = await _archive_parts_match(
+        client, result["title"], result["channel"].id, expected_parts
+    )
     if not (_edit_matches_readback(edit, page)
             and owner_matches
             and marker_present
-            and saved_streams == expected_streams):
+            and saved_streams == expected_streams
+            and saved_parts == expected_parts
+            and parts_match):
         raise WikiError("final archive failed read-back verification")
     result["revid"] = page["revid"]
     result["ok"] = True
@@ -1406,6 +1513,7 @@ async def publish(
         # Do not retain large staged/final page bodies in the summary list.
         result.pop("_final_text", None)
         result.pop("_stream_boundaries", None)
+        result.pop("_part_manifest", None)
 
     ok = [r for r in results if r.get("ok")]
     bad = [r for r in results if not r.get("ok")]

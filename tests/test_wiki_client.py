@@ -34,6 +34,18 @@ class ExpiredReadClient(MediaWikiClient):
         return {"query": {"userinfo": {"name": "bot"}}}
 
 
+class CapturingEditClient(MediaWikiClient):
+    def __init__(self):
+        super().__init__("https://wiki.invalid/api.php", "bot", "secret")
+        self.logged_in = True
+        self._csrf = "csrf"
+        self.submitted = None
+
+    async def _post(self, data, *, files=None):
+        self.submitted = dict(data)
+        return {"edit": {"result": "Success", "newrevid": 43}}
+
+
 class WikiClientTests(unittest.TestCase):
     def test_private_read_reauthenticates_once_after_session_expiry(self):
         client = ExpiredReadClient()
@@ -41,6 +53,20 @@ class WikiClientTests(unittest.TestCase):
         self.assertEqual(result["name"], "bot")
         self.assertEqual(client.login_calls, 1)
         self.assertEqual(client.query_calls, 2)
+
+    def test_edit_can_atomically_guard_existing_or_new_pages(self):
+        client = CapturingEditClient()
+        asyncio.run(client.edit_page(
+            "Archive:Test", "content", "summary", baserevid=42
+        ))
+        self.assertEqual(client.submitted["baserevid"], "42")
+        self.assertNotIn("createonly", client.submitted)
+
+        asyncio.run(client.edit_page(
+            "Archive:New", "content", "summary", createonly=True
+        ))
+        self.assertEqual(client.submitted["createonly"], "1")
+        self.assertNotIn("baserevid", client.submitted)
 
 
 if __name__ == "__main__":

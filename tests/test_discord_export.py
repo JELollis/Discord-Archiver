@@ -37,6 +37,31 @@ class DiscordExportTests(unittest.TestCase):
         self.assertLessEqual(len(filename.encode("utf-8")), 200)
         self.assertTrue(filename.endswith(".png"))
 
+    def test_attachment_ids_survive_multibyte_name_truncation(self):
+        channel = "界" * 100
+        original = ("😀" * 100) + ".png"
+        first = discord_export.attachment_upload_name(channel, 111, 222, original)
+        second = discord_export.attachment_upload_name(channel, 333, 444, original)
+        self.assertTrue(first.startswith("111-222-"))
+        self.assertTrue(second.startswith("333-444-"))
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(first.encode("utf-8")), 200)
+        self.assertTrue(first.endswith(".png"))
+
+    def test_part_manifest_is_contiguous_and_hashes_saved_content(self):
+        manifest = [
+            (1, discord_export.content_sha256("part one")),
+            (2, discord_export.content_sha256("part two")),
+        ]
+        rendered = discord_export.render_part_manifest(manifest)
+        self.assertEqual(discord_export.parse_part_manifest(rendered), manifest)
+        self.assertIsNone(discord_export.parse_part_manifest(
+            rendered.replace("archive_part=2", "archive_part=3")
+        ))
+        self.assertEqual(
+            discord_export.parse_part_manifest("<!-- archive_part_count=0 -->"), []
+        )
+
     def test_behavior_switches_are_neutralized(self):
         escaped = discord_export.escape_wikitext("__NOTOC__ __NOINDEX__")
         self.assertNotIn("__NOTOC__", escaped)

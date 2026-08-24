@@ -215,6 +215,7 @@ class MediaWikiClient:
         *,
         bot: bool = True,
         createonly: bool = False,
+        baserevid: Optional[int] = None,
     ) -> dict:
         """Create or overwrite a page; returns the API ``edit`` result."""
         await self._ensure_csrf()
@@ -229,6 +230,8 @@ class MediaWikiClient:
             data["bot"] = "1"
         if createonly:
             data["createonly"] = "1"
+        if baserevid is not None:
+            data["baserevid"] = str(baserevid)
         async def submit():
             data["token"] = self._csrf
             result = await self._post(data)
