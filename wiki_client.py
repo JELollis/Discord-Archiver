@@ -13,6 +13,8 @@ as a fallback:
     MEDIAWIKI_BOT_USERNAME     e.g. DiscordArchiveBot@ArchivePublisher
     MEDIAWIKI_BOT_PASSWORD     the BotPassword secret
     MEDIAWIKI_ARCHIVE_NAMESPACE  e.g. Archive
+    MEDIAWIKI_UPLOAD_CHUNK_MIB   optional, defaults to 20
+    MEDIAWIKI_MAX_ATTACHMENT_MIB optional bot safety cap, defaults to 500
 
 Note: the wiki sits behind Cloudflare, which rejects requests with a default
 library User-Agent, so every request sends an explicit UA below. When the bot
@@ -26,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -42,6 +45,8 @@ _TRANSPORT_RETRY_DELAYS = (1.0, 2.0, 4.0)
 _RATE_LIMIT_RETRY_DELAYS = (10.0, 20.0, 40.0)
 _RETRYABLE_API_CODES = frozenset({"ratelimited", "maxlag", "readonly"})
 _RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+_DEFAULT_UPLOAD_CHUNK_MIB = 20
+_DEFAULT_MAX_ATTACHMENT_MIB = 500
 
 
 class WikiError(Exception):
@@ -125,6 +130,22 @@ def load_config(env: Optional[dict] = None) -> dict:
     missing = [k for k in keys if not config.get(k)]
     if missing:
         raise WikiError(f"Missing MediaWiki configuration: {', '.join(missing)}")
+
+    for setting, default in (
+        ("MEDIAWIKI_UPLOAD_CHUNK_MIB", _DEFAULT_UPLOAD_CHUNK_MIB),
+        ("MEDIAWIKI_MAX_ATTACHMENT_MIB", _DEFAULT_MAX_ATTACHMENT_MIB),
+    ):
+        raw_value = values.get(setting, default)
+        try:
+            value_mib = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise WikiError(f"{setting} must be a positive whole number") from exc
+        if value_mib <= 0:
+            raise WikiError(f"{setting} must be a positive whole number")
+        config[f"{setting.removesuffix('_MIB')}_BYTES"] = value_mib * 1024 * 1024
+
+    if config["MEDIAWIKI_UPLOAD_CHUNK_BYTES"] > config["MEDIAWIKI_MAX_ATTACHMENT_BYTES"]:
+        raise WikiError("MEDIAWIKI_UPLOAD_CHUNK_MIB cannot exceed MEDIAWIKI_MAX_ATTACHMENT_MIB")
     return config
 
 
@@ -159,6 +180,7 @@ class MediaWikiClient:
         self._owns_session = session is None
         self._csrf: Optional[str] = None
         self.logged_in = False
+        self._max_upload_size: Optional[int] = None
         # One authenticated bot account shares one rate-limit budget and one
         # connection pool. Serializing requests also makes pool resets race-free.
         self._request_lock = asyncio.Lock()
@@ -403,6 +425,21 @@ class MediaWikiClient:
             "action": "query", "meta": "siteinfo", "siprop": "general",
         }))["query"]["general"].get("generator", "unknown")
 
+    async def max_upload_size(self) -> int:
+        """Return and cache MediaWiki's advertised total-file upload limit."""
+        if self._max_upload_size is None:
+            general = (await self._authenticated_get({
+                "action": "query", "meta": "siteinfo", "siprop": "general",
+            }))["query"]["general"]
+            try:
+                maximum = int(general["maxuploadsize"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise WikiError("MediaWiki siteinfo did not provide a valid maxuploadsize") from exc
+            if maximum <= 0:
+                raise WikiError("MediaWiki siteinfo returned a non-positive maxuploadsize")
+            self._max_upload_size = maximum
+        return self._max_upload_size
+
     async def edit_page(
         self,
         title: str,
@@ -459,22 +496,172 @@ class MediaWikiClient:
         async def submit():
             data["token"] = self._csrf
             result = await self._post(data, files=files)
-            if "error" in result:
-                error = result["error"]
-                # MediaWiki reports an exact duplicate as an error-shaped
-                # response even though the requested file is already present
-                # and usable. Treat this as an idempotent success.
-                if error.get("code") == "fileexists-no-change":
-                    return {
-                        "upload": {
-                            "result": "Success",
-                            "filename": filename,
-                            "duplicate": True,
-                        }
-                    }
-                raise WikiError(f"upload {filename!r} failed: {error}", error=error)
-            return result
+            return self._validate_upload_result(result, filename)
         return (await self._retry_after_auth_error(submit))["upload"]
+
+    @staticmethod
+    def _validate_upload_result(result: dict, filename: str) -> dict:
+        """Normalize idempotent upload success and preserve structured errors."""
+        if "error" not in result:
+            return result
+        error = result["error"]
+        # MediaWiki reports an exact duplicate as an error-shaped response even
+        # though the requested file is already present and usable.
+        if error.get("code") == "fileexists-no-change":
+            return {
+                "upload": {
+                    "result": "Success",
+                    "filename": filename,
+                    "duplicate": True,
+                }
+            }
+        raise WikiError(f"upload {filename!r} failed: {error}", error=error)
+
+    async def upload_file_from_path(
+        self,
+        filename: str,
+        path: str | os.PathLike[str],
+        comment: str = "",
+        *,
+        chunk_size: int,
+        ignorewarnings: bool = True,
+    ) -> dict:
+        """Upload a local file, using MediaWiki's native stash chunks when needed."""
+        path = Path(path)
+        filesize = path.stat().st_size
+        chunk_size = int(chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if filesize <= chunk_size:
+            content = await asyncio.to_thread(path.read_bytes)
+            return await self.upload_file(
+                filename, content, comment, ignorewarnings=ignorewarnings
+            )
+        return await self._upload_file_in_chunks(
+            filename,
+            path,
+            filesize,
+            comment,
+            chunk_size=chunk_size,
+            ignorewarnings=ignorewarnings,
+        )
+
+    async def _upload_file_in_chunks(
+        self,
+        filename: str,
+        path: Path,
+        filesize: int,
+        comment: str,
+        *,
+        chunk_size: int,
+        ignorewarnings: bool,
+    ) -> dict:
+        """Stage bounded chunks and commit them as one MediaWiki file."""
+        await self._ensure_csrf()
+        offset = 0
+        filekey = None
+
+        with path.open("rb") as handle:
+            while offset < filesize:
+                chunk = await asyncio.to_thread(
+                    handle.read, min(chunk_size, filesize - offset)
+                )
+                if not chunk:
+                    raise WikiError(
+                        f"chunk upload {filename!r} ended at {offset} of {filesize} bytes"
+                    )
+                data = {
+                    "action": "upload",
+                    "stash": "1",
+                    "filename": filename,
+                    "filesize": str(filesize),
+                    "offset": str(offset),
+                    "token": self._csrf,
+                }
+                if filekey is not None:
+                    data["filekey"] = filekey
+                if ignorewarnings:
+                    data["ignorewarnings"] = "1"
+                files = {
+                    "chunk": (
+                        filename,
+                        chunk,
+                        "application/octet-stream",
+                    )
+                }
+
+                async def submit_chunk():
+                    data["token"] = self._csrf
+                    result = await self._post(data, files=files)
+                    if "error" in result:
+                        error = result["error"]
+                        raise WikiError(
+                            f"chunk upload {filename!r} failed at byte {offset}: {error}",
+                            error=error,
+                        )
+                    return result
+
+                result = await self._retry_after_auth_error(submit_chunk)
+                upload = result.get("upload", {})
+                stash_errors = upload.get("stasherrors")
+                if stash_errors:
+                    error = {
+                        "code": "stashfailed",
+                        "info": "MediaWiki rejected the completed upload stash",
+                        "details": stash_errors,
+                    }
+                    raise WikiError(
+                        f"chunk upload {filename!r} failed verification: {stash_errors}",
+                        error=error,
+                    )
+                expected_offset = offset + len(chunk)
+                next_offset = upload.get("offset")
+                if next_offset is None and expected_offset == filesize:
+                    # MediaWiki's final stash response contains filekey/imageinfo
+                    # but omits the offset present on intermediate Continue replies.
+                    next_offset = expected_offset
+                else:
+                    try:
+                        next_offset = int(next_offset)
+                    except (TypeError, ValueError) as exc:
+                        raise WikiError(
+                            f"chunk upload {filename!r} returned an invalid offset: {upload}"
+                        ) from exc
+                if next_offset != expected_offset:
+                    raise WikiError(
+                        f"chunk upload {filename!r} returned offset {next_offset}; expected {expected_offset}"
+                    )
+                filekey = upload.get("filekey") or upload.get("sessionkey") or filekey
+                if not filekey:
+                    raise WikiError(
+                        f"chunk upload {filename!r} did not return a file key"
+                    )
+                offset = next_offset
+                logging.info(
+                    "MediaWiki chunk upload %r: %d/%d bytes staged (%.1f%%).",
+                    filename,
+                    offset,
+                    filesize,
+                    offset * 100 / filesize,
+                )
+
+        data = {
+            "action": "upload",
+            "filename": filename,
+            "filekey": filekey,
+            "comment": comment,
+            "token": self._csrf,
+        }
+        if ignorewarnings:
+            data["ignorewarnings"] = "1"
+
+        async def commit_upload():
+            data["token"] = self._csrf
+            result = await self._post(data)
+            return self._validate_upload_result(result, filename)
+
+        result = await self._retry_after_auth_error(commit_upload)
+        return result["upload"]
 
     async def get_page(self, title: str) -> Optional[dict]:
         """Return latest content and bounded revision metadata, or ``None``."""

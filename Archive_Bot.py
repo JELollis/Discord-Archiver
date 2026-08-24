@@ -1,17 +1,23 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+import asyncio
 import datetime
 import os
-import io
-import zipfile
-import hashlib
 import logging
 import urllib.parse
 import re
+from pathlib import Path
+import tempfile
 
 from wiki_client import MediaWikiClient, WikiError, load_config
 import discord_export
+from attachment_archive import (
+    AttachmentTooLargeError,
+    create_zip_file,
+    file_sha1_and_size,
+    stage_discord_attachment,
+)
 from discord_rate_limit import (
     AsyncActionPacer,
     MIN_DISCORD_ACTION_INTERVAL_SECONDS,
@@ -321,17 +327,6 @@ async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     return messages, complete
 
 
-MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # matches $wgMaxUploadSize on the wiki
-
-
-def _zip_bytes(inner_filename: str, data: bytes) -> bytes:
-    """Wrap one file in an in-memory ZIP for safe archival fallback."""
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(inner_filename, data)
-    return buffer.getvalue()
-
-
 async def archive_attachments(client: MediaWikiClient, channel_name: str, messages: list) -> int:
     """Upload each attachment to the wiki; annotate dicts with wiki_filename/error.
 
@@ -341,6 +336,18 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
     MediaWiki's upload verification.
     """
     uploaded = 0
+    wiki_maximum = await client.max_upload_size()
+    configured_maximum = WIKI_CONFIG["MEDIAWIKI_MAX_ATTACHMENT_BYTES"]
+    maximum_size = min(wiki_maximum, configured_maximum)
+    chunk_size = min(WIKI_CONFIG["MEDIAWIKI_UPLOAD_CHUNK_BYTES"], maximum_size)
+    logging.info(
+        "Attachment archive limits for #%s: wiki=%d bytes, bot=%d bytes, effective=%d bytes, chunk=%d bytes.",
+        channel_name,
+        wiki_maximum,
+        configured_maximum,
+        maximum_size,
+        chunk_size,
+    )
     for m in messages:
         for att in m["attachments"]:
             obj = att.pop("_obj", None)
@@ -348,29 +355,66 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
                 att["error"] = "attachment unavailable"
                 continue
             try:
-                limit_mb = MAX_ATTACHMENT_BYTES // (1024 * 1024)
-                if att.get("size", 0) > MAX_ATTACHMENT_BYTES:
-                    raise WikiError(f"attachment exceeds the {limit_mb} MiB archive limit")
-                data = await obj.read()
+                expected_size = int(att.get("size", 0))
+                logging.info(
+                    "Staging Discord attachment #%s msg %s: %r (%d bytes).",
+                    channel_name,
+                    m["id"],
+                    att["filename"],
+                    expected_size,
+                )
                 name = discord_export.attachment_upload_name(channel_name, m["id"], att["id"], att["filename"])
-                uploaded_data = data
-                try:
-                    result = await client.upload_file(name, data, comment=f"Discord attachment from #{channel_name}")
-                    att["wiki_filename"] = result.get("filename") or name
-                except WikiError as exc:
-                    if not exc.is_file_type_rejection:
-                        raise
-                    # The wiki cannot safely accept this type directly; preserve it
-                    # inside a ZIP while leaving MIME/executable checks enabled.
-                    zip_name = discord_export.zip_fallback_upload_name(name)
-                    uploaded_data = _zip_bytes(att["filename"], data)
-                    result = await client.upload_file(
-                        zip_name, uploaded_data,
-                        comment=f"Discord attachment (zipped) from #{channel_name}")
-                    att["wiki_filename"] = result.get("filename") or zip_name
-                    att["zipped"] = True
-                att["wiki_sha1"] = hashlib.sha1(uploaded_data).hexdigest()
-                att["wiki_size"] = len(uploaded_data)
+                with tempfile.TemporaryDirectory(prefix="discord-archive-") as temp_dir:
+                    source_path = Path(temp_dir) / "attachment.bin"
+                    await stage_discord_attachment(
+                        obj,
+                        source_path,
+                        expected_size=expected_size,
+                        maximum_size=maximum_size,
+                        memory_threshold=chunk_size,
+                    )
+                    uploaded_path = source_path
+                    try:
+                        result = await client.upload_file_from_path(
+                            name,
+                            source_path,
+                            comment=f"Discord attachment from #{channel_name}",
+                            chunk_size=chunk_size,
+                        )
+                        att["wiki_filename"] = result.get("filename") or name
+                    except WikiError as exc:
+                        if not exc.is_file_type_rejection:
+                            raise
+                        # Preserve blocked/mismatched types in a ZIP. The outer
+                        # upload name has no compound extension, while the entry
+                        # inside the ZIP retains its original Discord filename.
+                        zip_name = discord_export.zip_fallback_upload_name(name)
+                        zip_path = Path(temp_dir) / "attachment.zip"
+                        await asyncio.to_thread(
+                            create_zip_file,
+                            source_path,
+                            zip_path,
+                            att["filename"],
+                        )
+                        _, zip_size = await asyncio.to_thread(file_sha1_and_size, zip_path)
+                        if zip_size > maximum_size:
+                            raise AttachmentTooLargeError(
+                                f"zipped attachment is {zip_size} bytes; archive limit is {maximum_size} bytes"
+                            )
+                        uploaded_path = zip_path
+                        result = await client.upload_file_from_path(
+                            zip_name,
+                            zip_path,
+                            comment=f"Discord attachment (zipped) from #{channel_name}",
+                            chunk_size=chunk_size,
+                        )
+                        att["wiki_filename"] = result.get("filename") or zip_name
+                        att["zipped"] = True
+                    digest, uploaded_size = await asyncio.to_thread(
+                        file_sha1_and_size, uploaded_path
+                    )
+                    att["wiki_sha1"] = digest
+                    att["wiki_size"] = uploaded_size
                 uploaded += 1
             except Exception as exc:
                 att["error"] = str(exc)

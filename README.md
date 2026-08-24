@@ -45,6 +45,7 @@ Admin (Discord)                         Members (browser / mobile)
 |---|---|
 | `Archive_Bot.py` | **Current bot** — course management + wiki archiving (`/publish`, `/delete` gate, `/wiki_status`, `/help`). |
 | `wiki_client.py` | Async MediaWiki API client (BotPassword login, edit, upload, read-back verify). |
+| `attachment_archive.py` | Bounded-memory Discord attachment staging, ZIP fallback, and digest helpers. |
 | `discord_export.py` | Renders a captured channel into safe MediaWiki wikitext (mention resolution, escaping, page-title mapping). |
 | `Archive_Bot2.py` | Previous bot version, kept for reference/rollback. |
 | `archive.py`, `roles_generator.py`, `quick_update.py` | Older/utility scripts. |
@@ -90,12 +91,19 @@ The bot reads two pieces of configuration; **neither is committed to the reposit
    MEDIAWIKI_BOT_USERNAME=DiscordArchiveBot@ArchivePublisher
    MEDIAWIKI_BOT_PASSWORD=<BotPassword secret>
    MEDIAWIKI_ARCHIVE_NAMESPACE=Archive
+   MEDIAWIKI_UPLOAD_CHUNK_MIB=20
+   MEDIAWIKI_MAX_ATTACHMENT_MIB=500
    ```
 
    The BotPassword is created in the wiki at `Special:BotPasswords` with grants for editing, uploading, and
    **High-volume (bot) access**. The underlying service account must also have the `noratelimit` right. Run
    `/wiki_status` to verify the effective login retains it; the bot uses bounded backoff if it does not.
    If the wiki settings are absent, the bot still runs but the wiki commands are disabled.
+
+   Attachments larger than `MEDIAWIKI_UPLOAD_CHUNK_MIB` are downloaded to a temporary file and sent through
+   MediaWiki's native stash/chunk API, then committed as one wiki file. The effective total attachment limit is
+   the smaller of `MEDIAWIKI_MAX_ATTACHMENT_MIB` and the wiki's advertised `maxuploadsize`; increase
+   `$wgMaxUploadSize` in the wiki configuration before expecting files over its current limit to succeed.
 
 ## Running
 
