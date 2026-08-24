@@ -16,7 +16,8 @@ The bot captures a channel's full history, uploads its attachments, publishes a 
 - **Wiki archiving** — copy a Discord text channel to the wiki as a formatted page (authors,
   timestamps, message text with mentions resolved, attachments, reply links), with read-back
   verification and a link posted to `#archives`.
-- **Guarded deletion** — a text channel can only be deleted after it has a verified wiki archive.
+- **Guarded deletion** — text channels require a current verified wiki archive; unsupported message
+  channels are blocked, and voice/stage channels must have empty persistent text chat.
 - **Private wiki with Discord SSO** — the wiki is readable only by verified members, logging in with
   Discord via Authentik (OpenID Connect).
 
@@ -51,7 +52,7 @@ Admin (Discord)                         Members (browser / mobile)
 
 | Command | What it does |
 |---|---|
-| `/publish [channel] [category] [channels]` | Archive a channel, a whole category, or a list of channels to the wiki (capture → upload → publish → verify → post link). |
+| `/publish [channel] [category] [channels]` | Archive a read-only channel, category, or channel list to the wiki (stage → post link → finalize → verify). |
 | `/wiki_status` | Check the wiki connection and the bot's wiki permissions. |
 | `/delete target_type targets` | Permanently delete channels/categories (confirmation + requires a verified archive). |
 | `/archive term year` | Move a term's channels into a read-only Discord archive category. |
@@ -60,6 +61,9 @@ Admin (Discord)                         Members (browser / mobile)
 | `/help [command]` | List commands, or show full help for one. |
 
 Command parameters and safety behavior are also available through the bot's `/help` command.
+
+The required retirement workflow is `/archive` → `/publish` → `/delete`. `/publish` refuses writable
+channels, and `/delete` revalidates the parent channel and every thread immediately before removal.
 
 ## Wiki page structure
 

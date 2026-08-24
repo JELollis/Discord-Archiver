@@ -32,6 +32,7 @@ _WIKI_ESCAPE = {
 }
 # Characters that start structural wikitext when they lead a line.
 _LINE_LEAD = set("*#:;=! ")
+_BEHAVIOR_SWITCH = re.compile(r"__[A-Z][A-Z0-9_]*__", re.IGNORECASE)
 
 
 def escape_wikitext(text: str) -> str:
@@ -45,6 +46,12 @@ def escape_wikitext(text: str) -> str:
         return ""
     text = "".join(_WIKI_ESCAPE.get(ch, ch) for ch in text)
     text = re.sub(r"'{2,}", lambda m: "&#39;" * len(m.group()), text)
+    # MediaWiki behavior switches such as __NOTOC__ and __NOINDEX__ affect the
+    # entire page even inside indented text. Encode their underscores while
+    # preserving the visible message text.
+    text = _BEHAVIOR_SWITCH.sub(
+        lambda m: m.group().replace("_", "&#95;"), text
+    )
     # MediaWiki substitutes runs of 3-5 tildes (~~~/~~~~/~~~~~) for the editing
     # user's signature and/or timestamp during a save; encode them so archived
     # message text is preserved verbatim instead of being rewritten.
@@ -116,17 +123,26 @@ def sanitize_title_part(text: str) -> str:
 
 
 def sanitize_filename(name: str) -> str:
-    """Make an upload filename safe (keep extension; strip title-hostile chars)."""
+    """Make an upload filename safe and keep it below 200 UTF-8 bytes.
+
+    MediaWiki applies its title limit to bytes, not Python characters. Keeping
+    the extension while truncating by bytes avoids rejecting filenames that
+    contain many emoji or CJK characters.
+    """
     name = name.replace(" ", "_")
     name = re.sub(r"[#<>\[\]|{}:/]+", "-", name)
     name = re.sub(r"-{2,}", "-", name).strip("-._") or "file"
-    if len(name) <= 200:
+    if len(name.encode("utf-8")) <= 200:
         return name
     stem, dot, extension = name.rpartition(".")
     if not dot or not extension:
-        return name[:200]
+        return _truncate_bytes(name, 200).rstrip("-._") or "file"
     suffix = f".{extension}"
-    return f"{stem[:200 - len(suffix)]}{suffix}"
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if suffix_bytes >= 200:
+        return _truncate_bytes(name, 200).rstrip("-._") or "file"
+    stem = _truncate_bytes(stem, 200 - suffix_bytes).rstrip("-._") or "file"
+    return f"{stem}{suffix}"
 
 
 _CHANNEL_PATTERN = re.compile(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", re.IGNORECASE)
@@ -178,6 +194,7 @@ def render_page(
     meta: dict,
     *,
     index: bool = False,
+    part: bool = False,
     anchor_index: dict | None = None,
     self_title: str | None = None,
 ) -> str:
@@ -189,9 +206,11 @@ def render_page(
     message_count, source).
 
     ``index`` marks a split archive's index page (suppresses the empty-channel
-    notice). ``anchor_index`` maps a message id to the page title that holds it,
-    and ``self_title`` is this page's title, so cross-part reply links point at
-    the correct part page instead of a dead same-page anchor.
+    notice). ``part`` marks an auxiliary content page: it intentionally carries
+    no deletion-clearance marker, without falsely labeling successful content as
+    incomplete. ``anchor_index`` maps a message id to the page title that holds
+    it, and ``self_title`` is this page's title, so cross-part reply links point
+    at the correct part page instead of a dead same-page anchor.
     """
     lines = [
         "{{stub}}" if False else "",
@@ -255,13 +274,24 @@ def render_page(
     lines.append("[[Category:Discord archive]]")
     if meta.get("category"):
         lines.append(f"[[Category:{escape_wikitext(meta['category'])}]]")
-    if meta.get("complete", True):
+    # Ownership survives incomplete publication. The completion marker below is
+    # deliberately absent until every required publication step succeeds, but a
+    # failed/in-progress page must still be protected from another same-named
+    # Discord channel overwriting it.
+    lines.append(f"<!-- archive_owner_channel_id={meta.get('channel_id')} -->")
+    if part:
+        lines.append("<!-- Archive part; deletion clearance is recorded on the canonical index page. -->")
+    elif meta.get("complete", True):
+        # A boundary per independently-read message stream prevents a later
+        # thread snowflake from hiding a parent message that arrived mid-capture.
+        for stream_id, boundary in sorted(meta.get("stream_boundaries", {}).items()):
+            lines.append(f"<!-- source_stream_id={stream_id} captured_until={boundary} -->")
         lines.append(
             f"<!-- source_channel_id={meta.get('channel_id')} captured_at={meta.get('captured_at')} "
             f"captured_until={meta.get('captured_until')} -->"
         )
     else:
-        lines.append("<!-- INCOMPLETE: attachment or capture errors; deletion is blocked. -->")
+        lines.append("<!-- INCOMPLETE: publication is not finalised; deletion is blocked. -->")
     return "\n".join(lines)
 
 
@@ -275,14 +305,18 @@ def split_messages(messages: list, channel_name: str, meta: dict, max_bytes: int
     # Measure each message's rendered byte cost once (O(n) total) instead of
     # re-rendering the whole growing chunk every iteration (which was O(n^2) and
     # could stall /publish on very active channels). The per-message cost is the
-    # rendered page size minus the fixed header/footer overhead; summing these
-    # slightly overestimates a chunk (per-message blank lines are counted once
-    # each), which only makes splitting more conservative — always safe.
+    # rendered page size minus the fixed header/footer overhead.
     part_meta = {**meta, "complete": False}
-    overhead = len(render_page(channel_name, [], part_meta).encode("utf-8"))
+    # index=True suppresses the empty-channel notice. Non-empty part pages do not
+    # contain that notice either, so this is their real fixed overhead; including
+    # it here would subtract the notice from every message cost and undercount
+    # channels containing many short messages.
+    overhead = len(render_page(
+        channel_name, [], part_meta, index=True, part=True
+    ).encode("utf-8"))
 
     def msg_cost(m) -> int:
-        rendered = render_page(channel_name, [m], part_meta)
+        rendered = render_page(channel_name, [m], part_meta, part=True)
         return max(1, len(rendered.encode("utf-8")) - overhead)
 
     chunks = []

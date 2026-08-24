@@ -168,24 +168,42 @@ class MediaWikiClient:
             await self.login()
 
     async def _retry_after_auth_error(self, operation):
-        """Retry one mutation after clearing stale login/CSRF state."""
+        """Retry one API operation after clearing stale login/CSRF state."""
         try:
             return await operation()
         except WikiError as exc:
-            if "badtoken" not in str(exc).lower() and "not logged in" not in str(exc).lower():
+            message = str(exc).lower()
+            auth_errors = (
+                "badtoken", "notloggedin", "not logged in", "assertuserfailed",
+                "readapidenied", "permissiondenied",
+            )
+            if not any(token in message for token in auth_errors):
                 raise
             self._csrf = None
             self.logged_in = False
             await self.login()
             return await operation()
 
+    async def _authenticated_get(self, params: dict) -> dict:
+        """Run a private-wiki query and re-login once if its session expired."""
+        if not self.logged_in:
+            await self.login()
+
+        async def submit():
+            result = await self._get(params)
+            if "error" in result:
+                raise WikiError(f"MediaWiki query failed: {result['error']}")
+            return result
+
+        return await self._retry_after_auth_error(submit)
+
     async def userinfo(self) -> dict:
-        return (await self._get({
+        return (await self._authenticated_get({
             "action": "query", "meta": "userinfo", "uiprop": "groups|rights",
         }))["query"]["userinfo"]
 
     async def site_generator(self) -> str:
-        return (await self._get({
+        return (await self._authenticated_get({
             "action": "query", "meta": "siteinfo", "siprop": "general",
         }))["query"]["general"].get("generator", "unknown")
 
@@ -260,7 +278,7 @@ class MediaWikiClient:
 
     async def get_page(self, title: str) -> Optional[dict]:
         """Return {pageid, revid, content} for the latest revision, or None."""
-        result = await self._get({
+        result = await self._authenticated_get({
             "action": "query",
             "prop": "revisions",
             "rvprop": "ids|content",

@@ -1,6 +1,8 @@
 web.config
 /.idea
 /__pycache__
+__pycache__/
+*.py[cod]
 Bot Key.txt
 /logs
 quick_update.py
