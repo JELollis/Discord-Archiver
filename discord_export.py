@@ -154,6 +154,11 @@ _THREAD_COUNT_RE = re.compile(r"<!-- source_thread_count=(\d+) -->")
 _THREAD_MARKER_RE = re.compile(
     r"<!-- source_thread_id=(\d+) name_sha256=([0-9a-f]{64}) -->"
 )
+# NAS-hosted ("external") attachments too large for the wiki: linked, not uploaded.
+_EXTERNAL_COUNT_RE = re.compile(r"<!-- archive_external_count=(\d+) -->")
+_EXTERNAL_MARKER_RE = re.compile(
+    r"<!-- archive_external filename=([^ \n]+) sha1=([0-9a-f]{40}) size=(\d+) -->"
+)
 _CANONICAL_MARKER_RE = re.compile(
     r"<!-- archive_canonical_sha256=([0-9a-f]{64}) -->"
 )
@@ -226,6 +231,39 @@ def parse_attachment_manifest(
             return None
         entries.append((filename, digest, int(size)))
     if len(entries) != expected_count or len({name for name, _digest, _size in entries}) != len(entries):
+        return None
+    return sorted(entries)
+
+
+def render_external_manifest(
+    externals: list[tuple[str, str, int]],
+) -> str:
+    """Render NAS-hosted (external) attachment names, SHA-1 digests, and sizes."""
+    ordered = sorted(externals)
+    lines = [f"<!-- archive_external_count={len(ordered)} -->"]
+    lines.extend(
+        "<!-- archive_external "
+        f"filename={urllib.parse.quote(filename, safe='')} sha1={digest} size={size} -->"
+        for filename, digest, size in ordered
+    )
+    return "\n".join(lines)
+
+
+def parse_external_manifest(
+    content: str,
+) -> list[tuple[str, str, int]] | None:
+    """Parse one complete, unique external (NAS) attachment manifest."""
+    count_matches = _EXTERNAL_COUNT_RE.findall(content)
+    if len(count_matches) != 1:
+        return None
+    expected_count = int(count_matches[0])
+    entries = []
+    for encoded, digest, size in _EXTERNAL_MARKER_RE.findall(content):
+        filename = urllib.parse.unquote(encoded)
+        if urllib.parse.quote(filename, safe="") != encoded:
+            return None
+        entries.append((filename, digest, int(size)))
+    if len(entries) != expected_count or len({name for name, _d, _s in entries}) != len(entries):
         return None
     return sorted(entries)
 
@@ -365,10 +403,30 @@ def zip_fallback_upload_name(upload_name: str) -> str:
 _IMAGE_EXT = {"png", "gif", "jpg", "jpeg", "webp"}
 
 
+def _human_size(num_bytes) -> str:
+    """Format a byte count as a short human-readable size (e.g. 1.4 GB)."""
+    try:
+        size = float(num_bytes)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def _render_attachment(att: dict) -> str:
     """Render one attachment as wikitext, using its uploaded wiki filename."""
-    wiki_name = att.get("wiki_filename")
     original = escape_wikitext(att.get("filename", "file"))
+    # NAS-hosted (external) attachment: too large for the wiki, stored on the file
+    # share and linked directly. Rendered as an external link, not a File: embed.
+    nas_url = att.get("nas_url")
+    if nas_url:
+        size = att.get("nas_size")
+        suffix = f" ''({_human_size(size)}, external)''" if size else " ''(external)''"
+        return f"&#128206; [{nas_url} {original}]{suffix}"
+    wiki_name = att.get("wiki_filename")
     if not wiki_name:
         return f"&#128206; {original} ''(attachment not archived: {escape_wikitext(att.get('error', 'upload skipped'))})''"
     ext = wiki_name.rsplit(".", 1)[-1].lower() if "." in wiki_name else ""

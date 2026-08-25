@@ -331,6 +331,26 @@ async def _archive_attachments_match(
     return True
 
 
+async def _archive_external_attachments_match(
+    manifest: list[tuple[str, str, int]],
+) -> bool:
+    """Verify every NAS-hosted attachment still exists at its recorded size.
+
+    NAS files have no MediaWiki imageinfo, so the deletion gate verifies them by
+    reading the share directly. Existence + byte size (a cheap stat) is used
+    rather than re-hashing, since these can be multi-gigabyte files on a trusted
+    private store; that still fails closed if a file is deleted or truncated.
+    """
+    for filename, _digest, expected_size in manifest:
+        try:
+            stat = await asyncio.to_thread(_nas_path(filename).stat)
+        except OSError:
+            return False
+        if stat.st_size != expected_size:
+            return False
+    return True
+
+
 async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     """Read a channel's full history AND all its threads (oldest first).
 
@@ -411,12 +431,97 @@ async def _reuse_archived_attachment(
     return True
 
 
+# Attachments of these types always go to the NAS store rather than the wiki,
+# regardless of size (they are large and/or blocked by MediaWiki anyway).
+_NAS_EXTENSIONS = {"iso"}
+
+
+def _nas_public_url(nas_filename: str) -> str:
+    base = WIKI_CONFIG["ARCHIVE_NAS_URL_BASE"]
+    return f"{base}/" + urllib.parse.quote(nas_filename, safe="")
+
+
+def _nas_path(nas_filename: str) -> Path:
+    return Path(WIKI_CONFIG["ARCHIVE_NAS_DIR"]) / nas_filename
+
+
+def _annotate_nas_attachment(att: dict, nas_name: str, digest: str, size: int) -> None:
+    att["nas_filename"] = nas_name
+    att["nas_url"] = _nas_public_url(nas_name)
+    att["nas_sha1"] = digest
+    att["nas_size"] = size
+    att["external"] = True
+
+
+def _reuse_nas_attachment(
+    channel_name: str,
+    message_id: int,
+    att: dict,
+    existing_external: dict[str, tuple[str, int]],
+) -> bool:
+    """Reuse a NAS-stored attachment already present with its recorded size."""
+    nas_name = discord_export.attachment_upload_name(
+        channel_name, message_id, att["id"], att["filename"]
+    )
+    entry = existing_external.get(nas_name)
+    if entry is None:
+        return False
+    manifest_sha1, manifest_size = entry
+    try:
+        stat = _nas_path(nas_name).stat()
+    except OSError:
+        return False
+    if stat.st_size != manifest_size:
+        return False
+    _annotate_nas_attachment(att, nas_name, manifest_sha1, manifest_size)
+    return True
+
+
+async def _archive_to_nas(
+    channel_name: str, message_id: int, att: dict, obj, nas_max: int, chunk_size: int,
+) -> None:
+    """Stream an oversize/NAS-designated attachment to the file share and link it.
+
+    Downloads straight to the share (never the small root disk), verifies the
+    stored size, then annotates the attachment with its public URL + SHA-1/size so
+    the page links it and the deletion gate can verify it exists and is intact.
+    """
+    nas_name = discord_export.attachment_upload_name(
+        channel_name, message_id, att["id"], att["filename"]
+    )
+    final_path = _nas_path(nas_name)
+    part_path = final_path.with_name(final_path.name + ".part")
+    expected_size = int(att.get("size", 0))
+    logging.info(
+        "Staging oversize/NAS attachment #%s msg %s: %r (%d bytes) -> %s",
+        channel_name, message_id, att["filename"], expected_size, final_path,
+    )
+    try:
+        await stage_discord_attachment(
+            obj, part_path,
+            expected_size=expected_size,
+            maximum_size=nas_max,
+            memory_threshold=chunk_size,
+        )
+        digest, size = await asyncio.to_thread(file_sha1_and_size, part_path)
+        await asyncio.to_thread(os.replace, part_path, final_path)
+    except BaseException:
+        # Never leave a partial file that a later reuse might trust.
+        try:
+            await asyncio.to_thread(part_path.unlink, True)
+        except OSError:
+            pass
+        raise
+    _annotate_nas_attachment(att, nas_name, digest, size)
+
+
 async def archive_attachments(
     client: MediaWikiClient,
     channel_name: str,
     messages: list,
     *,
     existing_manifest: dict[str, tuple[str, int]] | None = None,
+    existing_external: dict[str, tuple[str, int]] | None = None,
 ) -> dict:
     """Upload each attachment to the wiki; annotate dicts with wiki_filename/error.
 
@@ -433,6 +538,10 @@ async def archive_attachments(
     """
     uploaded = 0
     reused = 0
+    nas_uploaded = 0
+    nas_reused = 0
+    nas_enabled = bool(WIKI_CONFIG.get("ARCHIVE_NAS_ENABLED"))
+    nas_max = int(WIKI_CONFIG.get("ARCHIVE_NAS_MAX_BYTES", 0))
     wiki_maximum = await client.max_upload_size()
     configured_maximum = WIKI_CONFIG["MEDIAWIKI_MAX_ATTACHMENT_BYTES"]
     maximum_size = min(wiki_maximum, configured_maximum)
@@ -457,10 +566,27 @@ async def archive_attachments(
                     channel_name, m["id"], att["wiki_filename"],
                 )
                 continue
+            if nas_enabled and existing_external and _reuse_nas_attachment(
+                channel_name, m["id"], att, existing_external
+            ):
+                nas_reused += 1
+                logging.info(
+                    "Reusing NAS attachment for #%s msg %s: %r.",
+                    channel_name, m["id"], att["nas_filename"],
+                )
+                continue
             if obj is None:
                 att["error"] = "attachment unavailable"
                 continue
+            extension = att["filename"].rsplit(".", 1)[-1].lower() if "." in att["filename"] else ""
+            route_to_nas = nas_enabled and (
+                int(att.get("size", 0)) > maximum_size or extension in _NAS_EXTENSIONS
+            )
             try:
+                if route_to_nas:
+                    await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size)
+                    nas_uploaded += 1
+                    continue
                 expected_size = int(att.get("size", 0))
                 logging.info(
                     "Staging Discord attachment #%s msg %s: %r (%d bytes).",
@@ -522,10 +648,30 @@ async def archive_attachments(
                     att["wiki_sha1"] = digest
                     att["wiki_size"] = uploaded_size
                 uploaded += 1
+            except AttachmentTooLargeError as exc:
+                # The real bytes exceeded the wiki cap. Fall back to the NAS store
+                # (re-downloading straight to the share) when it is available.
+                if nas_enabled and not route_to_nas:
+                    try:
+                        await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size)
+                        nas_uploaded += 1
+                        continue
+                    except Exception as nas_exc:
+                        att["error"] = f"too large for the wiki and the NAS store failed: {nas_exc}"
+                        logging.warning("NAS fallback failed (#%s msg %s): %s", channel_name, m["id"], nas_exc)
+                        continue
+                att["error"] = str(exc)
+                logging.warning("Attachment too large (#%s msg %s): %s", channel_name, m["id"], exc)
             except Exception as exc:
                 att["error"] = str(exc)
                 logging.warning("Attachment upload failed (#%s msg %s): %s", channel_name, m["id"], exc)
-    return {"archived": uploaded + reused, "uploaded": uploaded, "reused": reused}
+    return {
+        "archived": uploaded + reused + nas_uploaded + nas_reused,
+        "uploaded": uploaded,
+        "reused": reused,
+        "nas_uploaded": nas_uploaded,
+        "nas_reused": nas_reused,
+    }
 
 
 async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
@@ -596,6 +742,23 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
             return False
     except Exception as exc:
         logging.warning("Could not verify archived attachments for #%s: %s", channel.name, exc)
+        return False
+    # The external (NAS) manifest is newer than some archives. Its bytes are
+    # already covered by the verified canonical seal above, so an absent marker is
+    # a legacy page with no NAS files; only a present-but-malformed one blocks.
+    if "archive_external_count=" in page["content"]:
+        external_manifest = discord_export.parse_external_manifest(page["content"])
+        if external_manifest is None:
+            logging.warning("Ambiguous external (NAS) manifest for #%s; blocking deletion.", channel.name)
+            return False
+    else:
+        external_manifest = []
+    try:
+        if not await _archive_external_attachments_match(external_manifest):
+            logging.warning("NAS-hosted attachments changed or are missing for #%s; blocking deletion.", channel.name)
+            return False
+    except Exception as exc:
+        logging.warning("Could not verify NAS-hosted attachments for #%s: %s", channel.name, exc)
         return False
     thread_manifest = discord_export.parse_thread_manifest(page["content"])
     expected_thread_ids = set(stream_boundaries) - {channel.id}
@@ -1569,14 +1732,21 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         client, title, channel.id, channel.name,
     )
     existing_manifest = None
+    existing_external = None
     if canonical_page and discord_export.verify_canonical_content(canonical_page["content"]):
         parsed_manifest = discord_export.parse_attachment_manifest(canonical_page["content"])
         if parsed_manifest:
             existing_manifest = {
                 name: (sha1, size) for name, sha1, size in parsed_manifest
             }
+        parsed_external = discord_export.parse_external_manifest(canonical_page["content"])
+        if parsed_external:
+            existing_external = {
+                name: (sha1, size) for name, sha1, size in parsed_external
+            }
     attachment_stats = await archive_attachments(
-        client, channel.name, messages, existing_manifest=existing_manifest,
+        client, channel.name, messages,
+        existing_manifest=existing_manifest, existing_external=existing_external,
     )
     uploaded = attachment_stats["archived"]
     thread_names = {
@@ -1688,13 +1858,24 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         )
         for message in messages
         for att in message["attachments"]
-        if "error" not in att
+        if "error" not in att and not att.get("external")
+    )
+    external_manifest = sorted(
+        (
+            att["nas_filename"],
+            att["nas_sha1"],
+            att["nas_size"],
+        )
+        for message in messages
+        for att in message["attachments"]
+        if "error" not in att and att.get("external")
     )
     manifest_text = discord_export.render_part_manifest(part_manifest)
     attachment_text = discord_export.render_attachment_manifest(attachment_manifest)
-    final_text = f"{final_text}\n{manifest_text}\n{attachment_text}\n"
+    external_text = discord_export.render_external_manifest(external_manifest)
+    final_text = f"{final_text}\n{manifest_text}\n{attachment_text}\n{external_text}\n"
     final_text = discord_export.seal_canonical_content(final_text)
-    staged_text = f"{staged_text}\n{manifest_text}\n{attachment_text}\n"
+    staged_text = f"{staged_text}\n{manifest_text}\n{attachment_text}\n{external_text}\n"
     edit = await client.edit_page(
         title, staged_text, f"Stage archive #{channel.name} ({len(real_messages)} messages)",
         createonly=canonical_page is None,
@@ -1705,19 +1886,23 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
     owner_present = bool(saved_owner and int(saved_owner.group(1)) == channel.id)
     saved_manifest = discord_export.parse_part_manifest(page["content"] if page else "")
     saved_attachments = discord_export.parse_attachment_manifest(page["content"] if page else "")
+    saved_external = discord_export.parse_external_manifest(page["content"] if page else "")
     staged_parts_match = await _archive_parts_match(
         client, title, channel.id, part_manifest
     )
     staged_attachments_match = await _archive_attachments_match(
         client, attachment_manifest
     )
+    staged_external_match = await _archive_external_attachments_match(external_manifest)
     staged_verified = bool(
         owner_present
         and _edit_matches_readback(edit, page)
         and saved_manifest == part_manifest
         and saved_attachments == attachment_manifest
+        and saved_external == external_manifest
         and staged_parts_match
         and staged_attachments_match
+        and staged_external_match
     )
     ready = bool(meta["complete"] and staged_verified)
     if not meta["complete"]:
@@ -1732,6 +1917,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "messages": meta["message_count"], "attachments": uploaded,
         "uploaded_attachments": attachment_stats["uploaded"],
         "reused_attachments": attachment_stats["reused"],
+        "nas_attachments": attachment_stats["nas_uploaded"] + attachment_stats["nas_reused"],
         "revid": page["revid"] if page else None,
         "complete": meta["complete"],
         "error": error,
@@ -1739,6 +1925,7 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "_stream_boundaries": stream_boundaries,
         "_part_manifest": part_manifest,
         "_attachment_manifest": attachment_manifest,
+        "_external_manifest": external_manifest,
     }
 
 
@@ -1748,6 +1935,7 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
     expected_streams = result.pop("_stream_boundaries", {})
     expected_parts = result.pop("_part_manifest", [])
     expected_attachments = result.pop("_attachment_manifest", [])
+    expected_external = result.pop("_external_manifest", [])
     if not final_text:
         raise WikiError("archive was not ready for finalisation")
     if not await _archive_parts_match(
@@ -1756,6 +1944,8 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
         raise WikiError("archive parts changed before finalisation")
     if not await _archive_attachments_match(client, expected_attachments):
         raise WikiError("archived attachments changed before finalisation")
+    if not await _archive_external_attachments_match(expected_external):
+        raise WikiError("NAS-hosted attachments changed before finalisation")
     edit = await client.edit_page(
         result["title"], final_text,
         f"Finalise announced archive #{result['channel'].name}",
@@ -1775,20 +1965,24 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
     }
     saved_parts = discord_export.parse_part_manifest(page["content"] if page else "")
     saved_attachments = discord_export.parse_attachment_manifest(page["content"] if page else "")
+    saved_external = discord_export.parse_external_manifest(page["content"] if page else "")
     parts_match = await _archive_parts_match(
         client, result["title"], result["channel"].id, expected_parts
     )
     attachments_match = await _archive_attachments_match(
         client, expected_attachments
     )
+    external_match = await _archive_external_attachments_match(expected_external)
     if not (_edit_matches_readback(edit, page)
             and owner_matches
             and marker_present
             and saved_streams == expected_streams
             and saved_parts == expected_parts
             and saved_attachments == expected_attachments
+            and saved_external == expected_external
             and parts_match
             and attachments_match
+            and external_match
             and discord_export.verify_canonical_content(page["content"] if page else "")):
         raise WikiError("final archive failed read-back verification")
     result["revid"] = page["revid"]
@@ -2045,7 +2239,7 @@ async def publish(
             result["error"] = result["announcement_error"]
 
         # Do not retain large staged/final page bodies in the summary list.
-        for key in ("_final_text", "_stream_boundaries", "_part_manifest", "_attachment_manifest", "_empty_record"):
+        for key in ("_final_text", "_stream_boundaries", "_part_manifest", "_attachment_manifest", "_external_manifest", "_empty_record"):
             result.pop(key, None)
 
         if result.get("ok") and result.get("empty"):
@@ -2054,10 +2248,10 @@ async def publish(
         elif result.get("ok"):
             counts["published"] += 1
             logging.info(
-                "Publish %d/%d%s: #%s published (%d msgs, %d attachment(s): %d reused, %d uploaded)%s.",
+                "Publish %d/%d%s: #%s published (%d msgs, %d attachment(s): %d reused, %d uploaded, %d on NAS)%s.",
                 index, total, label_note, ch.name, result.get("messages", 0),
                 result.get("attachments", 0), result.get("reused_attachments", 0),
-                result.get("uploaded_attachments", 0),
+                result.get("uploaded_attachments", 0), result.get("nas_attachments", 0),
                 " via reused announcement" if result.get("announcement_reused") else "",
             )
         else:

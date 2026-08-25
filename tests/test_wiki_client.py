@@ -210,6 +210,29 @@ class WikiClientTests(unittest.TestCase):
         with self.assertRaises(WikiError):
             load_config(self._config_env(MEDIAWIKI_UPLOAD_CHUNK_MIB="0"))
 
+    def test_nas_sink_is_disabled_without_dir_and_url(self):
+        config = load_config(self._config_env())
+        self.assertFalse(config["ARCHIVE_NAS_ENABLED"])
+        # A default cap is still provided so callers can rely on the key.
+        self.assertEqual(config["ARCHIVE_NAS_MAX_BYTES"], 8192 * 1024 * 1024)
+
+    def test_nas_sink_enables_with_dir_and_url_and_trims_slash(self):
+        config = load_config(self._config_env(
+            ARCHIVE_NAS_DIR="/mnt/ISO/software",
+            ARCHIVE_NAS_URL_BASE="https://completeelectronics.net/software/",
+            ARCHIVE_NAS_MAX_MIB="4096",
+        ))
+        self.assertTrue(config["ARCHIVE_NAS_ENABLED"])
+        self.assertEqual(config["ARCHIVE_NAS_DIR"], "/mnt/ISO/software")
+        self.assertEqual(config["ARCHIVE_NAS_URL_BASE"], "https://completeelectronics.net/software")
+        self.assertEqual(config["ARCHIVE_NAS_MAX_BYTES"], 4096 * 1024 * 1024)
+
+    def test_nas_max_must_be_positive_integer(self):
+        with self.assertRaises(WikiError):
+            load_config(self._config_env(ARCHIVE_NAS_MAX_MIB="0"))
+        with self.assertRaises(WikiError):
+            load_config(self._config_env(ARCHIVE_NAS_MAX_MIB="lots"))
+
     def test_wiki_max_upload_size_is_validated_and_cached(self):
         client = SiteInfoClient("524288000")
         self.assertEqual(asyncio.run(client.max_upload_size()), 524_288_000)

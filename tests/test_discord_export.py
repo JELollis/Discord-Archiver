@@ -108,6 +108,32 @@ class DiscordExportTests(unittest.TestCase):
             rendered.replace("archive_attachment_count=2", "archive_attachment_count=3")
         ))
 
+    def test_external_manifest_is_complete_unique_and_byte_exact(self):
+        manifest = [
+            ("111-222-cpt-winPreVista.iso", "c" * 40, 3_221_225_472),
+            ("333-444-ist-lecture.mkv", "d" * 40, 512_000_000),
+        ]
+        rendered = discord_export.render_external_manifest(manifest)
+        self.assertEqual(discord_export.parse_external_manifest(rendered), sorted(manifest))
+        self.assertIsNone(discord_export.parse_external_manifest(
+            rendered.replace("archive_external_count=2", "archive_external_count=3")
+        ))
+        # Empty manifest round-trips to a zero count (new pages always carry it).
+        self.assertEqual(discord_export.parse_external_manifest(
+            discord_export.render_external_manifest([])
+        ), [])
+
+    def test_nas_attachment_renders_as_external_link(self):
+        wikitext = discord_export._render_attachment({
+            "filename": "winPreVista.iso",
+            "nas_url": "https://completeelectronics.net/software/111-222-winPreVista.iso",
+            "nas_size": 3_221_225_472,
+        })
+        self.assertIn("[https://completeelectronics.net/software/111-222-winPreVista.iso winPreVista.iso]", wikitext)
+        self.assertIn("external", wikitext)
+        self.assertNotIn("[[File:", wikitext)
+        self.assertNotIn("[[Media:", wikitext)
+
     def test_thread_manifest_detects_renames_by_id(self):
         rendered = discord_export.render_thread_manifest({20: "answers", 30: "界-thread"})
         parsed = discord_export.parse_thread_manifest(rendered)

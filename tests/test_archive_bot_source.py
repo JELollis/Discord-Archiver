@@ -210,6 +210,54 @@ class ArchiveBotSourceTests(unittest.TestCase):
         self.assertIsNotNone(fast_path_line, "publish must call is_channel_archived")
         self.assertLess(fast_path_line, publish_channel_line)
 
+    def test_oversize_attachments_route_to_the_nas_sink(self):
+        """archive_attachments must have a NAS route and a too-large fallback to it."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "archive_attachments")
+        nas_calls = [
+            node for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_archive_to_nas"
+        ]
+        # One on the pre-routed path, one in the AttachmentTooLargeError fallback.
+        self.assertGreaterEqual(len(nas_calls), 2)
+        handles_too_large = any(
+            isinstance(node, ast.ExceptHandler)
+            and node.type is not None
+            and "AttachmentTooLargeError" in ast.dump(node.type)
+            for node in ast.walk(function)
+        )
+        self.assertTrue(handles_too_large)
+
+    def test_deletion_gate_verifies_external_nas_manifest(self):
+        """is_channel_archived must verify NAS-hosted attachments too."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "is_channel_archived")
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_archive_external_attachments_match"
+            for node in ast.walk(function)
+        ))
+
+    def test_publish_builds_and_verifies_external_manifest(self):
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish_channel_to_wiki")
+        names = {
+            node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("render_external_manifest", names)
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_archive_external_attachments_match"
+            for node in ast.walk(function)
+        ))
+
     def test_publish_only_trusts_bot_authored_announcements(self):
         """Announcement reuse must gate on the bot's own authorship of #archives posts."""
         tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))

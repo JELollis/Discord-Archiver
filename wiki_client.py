@@ -158,6 +158,23 @@ def load_config(env: Optional[dict] = None) -> dict:
 
     if config["MEDIAWIKI_UPLOAD_CHUNK_BYTES"] > config["MEDIAWIKI_MAX_ATTACHMENT_BYTES"]:
         raise WikiError("MEDIAWIKI_UPLOAD_CHUNK_MIB cannot exceed MEDIAWIKI_MAX_ATTACHMENT_MIB")
+
+    # Optional NAS "oversize sink": attachments too large for the wiki (or of a
+    # designated type) are stored on a mounted file share and linked instead of
+    # uploaded. Disabled unless both a directory and a public URL base are set.
+    config["ARCHIVE_NAS_DIR"] = (values.get("ARCHIVE_NAS_DIR") or "").strip()
+    config["ARCHIVE_NAS_URL_BASE"] = (values.get("ARCHIVE_NAS_URL_BASE") or "").strip().rstrip("/")
+    nas_max_raw = values.get("ARCHIVE_NAS_MAX_MIB", 8192)
+    try:
+        nas_max_mib = int(nas_max_raw)
+    except (TypeError, ValueError) as exc:
+        raise WikiError("ARCHIVE_NAS_MAX_MIB must be a positive whole number") from exc
+    if nas_max_mib <= 0:
+        raise WikiError("ARCHIVE_NAS_MAX_MIB must be a positive whole number")
+    config["ARCHIVE_NAS_MAX_BYTES"] = nas_max_mib * 1024 * 1024
+    config["ARCHIVE_NAS_ENABLED"] = bool(
+        config["ARCHIVE_NAS_DIR"] and config["ARCHIVE_NAS_URL_BASE"]
+    )
     return config
 
 
