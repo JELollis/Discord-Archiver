@@ -56,8 +56,9 @@ class FakeContent:
 
 
 class FakeResponse:
-    def __init__(self, blocks):
+    def __init__(self, blocks, headers=None):
         self.content = FakeContent(blocks)
+        self.headers = headers or {}
         self.raise_calls = 0
 
     async def __aenter__(self):
@@ -71,8 +72,8 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, blocks, **_kwargs):
-        self.response = FakeResponse(blocks)
+    def __init__(self, blocks, headers=None, **_kwargs):
+        self.response = FakeResponse(blocks, headers=headers)
         self.requested_url = None
 
     async def __aenter__(self):
@@ -142,16 +143,54 @@ class AttachmentArchiveTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(attachment.read_calls, 0)
 
-    async def test_changed_attachment_size_is_rejected(self):
-        attachment = FakeAttachment(b"different")
+    async def test_small_attachment_trusts_read_over_discord_size(self):
+        # Discord's reported size can disagree with the bytes actually served;
+        # the complete read is trusted and stored regardless of that mismatch.
+        attachment = FakeAttachment(b"the real, larger bytes")
         with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaises(AttachmentArchiveError):
+            destination = Path(temp_dir) / "attachment.bin"
+            size = await stage_discord_attachment(
+                attachment,
+                destination,
+                expected_size=8,  # Discord under-reports
+                maximum_size=100,
+                memory_threshold=100,
+            )
+            self.assertEqual(size, len(b"the real, larger bytes"))
+            self.assertEqual(destination.read_bytes(), b"the real, larger bytes")
+
+    async def test_stream_completeness_uses_content_length_not_discord_size(self):
+        # A download matching the server's Content-Length succeeds even when it
+        # differs from Discord's declared attachment size.
+        attachment = FakeAttachment(b"ignored")
+
+        def ok_factory(**kwargs):
+            return FakeSession([b"abc", b"def"], headers={"Content-Length": "6"}, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "attachment.bin"
+            size = await stage_discord_attachment(
+                attachment, destination,
+                expected_size=3,  # Discord under-reports; real served length is 6
+                maximum_size=100, memory_threshold=2,
+                session_factory=ok_factory,
+            )
+            self.assertEqual(size, 6)
+            self.assertEqual(destination.read_bytes(), b"abcdef")
+
+    async def test_stream_short_read_against_content_length_is_rejected(self):
+        attachment = FakeAttachment(b"ignored")
+
+        def short_factory(**kwargs):
+            # Server promised 10 bytes but the stream delivered only 4.
+            return FakeSession([b"ab", b"cd"], headers={"Content-Length": "10"}, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(AttachmentArchiveError, "incomplete"):
                 await stage_discord_attachment(
-                    attachment,
-                    Path(temp_dir) / "attachment.bin",
-                    expected_size=8,
-                    maximum_size=20,
-                    memory_threshold=20,
+                    attachment, Path(temp_dir) / "attachment.bin",
+                    expected_size=10, maximum_size=100, memory_threshold=2,
+                    session_factory=short_factory,
                 )
 
     async def test_zip_preserves_safe_leaf_name_and_has_verifiable_digest(self):

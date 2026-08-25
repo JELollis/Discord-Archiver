@@ -95,6 +95,20 @@ class EmptyArchiveTests(unittest.TestCase):
         self.assertIn("&#124;", content)
         self.assertLess(content.index("channel_id=20"), content.index("channel_id=30"))
 
+    def test_parse_tolerates_mediawiki_trailing_newline_stripping(self):
+        content = empty_archive.render_empty_channel_list({20: record(20)})
+        # MediaWiki strips the trailing newline/whitespace on save, so the page
+        # read back is not byte-identical to what was written.
+        normalized = content.rstrip()
+        self.assertNotEqual(normalized, content)
+        self.assertEqual(empty_archive.parse_empty_channel_list(normalized), {20: record(20)})
+
+    def test_parse_still_rejects_trailing_nonwhitespace_injection(self):
+        content = empty_archive.render_empty_channel_list({20: record(20)})
+        self.assertIsNone(
+            empty_archive.parse_empty_channel_list(content.rstrip() + " tail-injection")
+        )
+
     def test_registry_rejects_tampering_duplicates_and_noncanonical_encoding(self):
         content = empty_archive.render_empty_channel_list({20: record(20)})
         self.assertIsNone(empty_archive.parse_empty_channel_list(

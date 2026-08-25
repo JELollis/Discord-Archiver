@@ -162,8 +162,12 @@ def parse_empty_channel_list(content: str) -> dict[int, dict] | None:
         return None
     # The seal protects the bytes, while deterministic re-rendering also proves
     # the human table and machine markers describe the same exact records with
-    # no extra bot-looking material inserted elsewhere on the page.
-    if render_empty_channel_list(records) != content:
+    # no extra bot-looking material inserted elsewhere on the page. Compare with
+    # trailing whitespace stripped: MediaWiki normalises away the trailing newline
+    # on save, so a byte-exact match would reject a page the bot itself wrote.
+    # rstrip() removes only whitespace, so any injected non-whitespace content is
+    # still detected.
+    if render_empty_channel_list(records).rstrip() != content.rstrip():
         return None
     return records
 

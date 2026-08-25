@@ -52,10 +52,12 @@ async def stage_discord_attachment(
             raise AttachmentTooLargeError(
                 f"attachment download reached {received} bytes; archive limit is {maximum_size} bytes"
             )
-        if received != expected_size:
-            raise AttachmentArchiveError(
-                f"attachment size changed during download (expected {expected_size}, received {received} bytes)"
-            )
+        # Discord's reported ``attachment.size`` is NOT a reliable completeness
+        # check: for some (notably re-encoded/migrated) images the CDN serves a
+        # different byte count than the metadata claims, in both directions.
+        # ``attachment.read()`` returns the entire HTTP body or raises, so a short
+        # read cannot pass silently; the archived SHA-1/size come from the bytes we
+        # actually store, not from ``attachment.size``.
         await asyncio.to_thread(destination.write_bytes, data)
         return received
 
@@ -72,9 +74,16 @@ async def stage_discord_attachment(
             total=None, sock_connect=30, sock_read=180
         )
     received = 0
+    content_length = None
     async with session_factory(**session_kwargs) as session:
         async with session.get(url) as response:
             response.raise_for_status()
+            declared = getattr(response, "headers", {}).get("Content-Length")
+            if declared is not None:
+                try:
+                    content_length = int(declared)
+                except (TypeError, ValueError):
+                    content_length = None
             with destination.open("wb") as handle:
                 async for block in response.content.iter_chunked(DOWNLOAD_BLOCK_BYTES):
                     if not block:
@@ -86,9 +95,14 @@ async def stage_discord_attachment(
                         )
                     handle.write(block)
 
-    if received != expected_size:
+    # Completeness is checked against the server's declared Content-Length (the
+    # authoritative length of what is actually served), not Discord's
+    # ``attachment.size`` metadata, which can disagree with the served bytes. When
+    # no Content-Length is sent, the streaming read cannot be under-verified here;
+    # a mid-stream connection error still propagates from ``iter_chunked``.
+    if content_length is not None and received != content_length:
         raise AttachmentArchiveError(
-            f"attachment size changed during download (expected {expected_size}, received {received} bytes)"
+            f"attachment download incomplete (server declared {content_length}, received {received} bytes)"
         )
     return received
 
