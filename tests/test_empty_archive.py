@@ -122,11 +122,11 @@ class EmptyArchiveTests(unittest.TestCase):
         noncanonical = empty_archive.discord_export.seal_canonical_content(noncanonical.rstrip())
         self.assertIsNone(empty_archive.parse_empty_channel_list(noncanonical))
 
-    def test_upsert_retries_conflict_and_preserves_existing_records(self):
+    def test_insert_retries_conflict_and_preserves_existing_records(self):
         original = empty_archive.render_empty_channel_list({20: record(20)})
         client = RegistryClient({"revid": 7, "content": original}, conflicts=1)
 
-        saved = asyncio.run(empty_archive.upsert_record(
+        saved = asyncio.run(empty_archive.insert_record(
             client, "Archive", record(30, name="ist-272-fall-2023"),
         ))
 
@@ -136,9 +136,9 @@ class EmptyArchiveTests(unittest.TestCase):
         self.assertEqual(client.edits[-1]["baserevid"], 7)
         self.assertFalse(client.edits[-1]["createonly"])
 
-    def test_upsert_creates_missing_registry(self):
+    def test_insert_creates_missing_registry(self):
         client = RegistryClient()
-        saved = asyncio.run(empty_archive.upsert_record(
+        saved = asyncio.run(empty_archive.insert_record(
             client, "Archive", record(20),
         ))
         self.assertEqual(
@@ -148,10 +148,36 @@ class EmptyArchiveTests(unittest.TestCase):
         self.assertTrue(client.edits[0]["createonly"])
         self.assertIsNone(client.edits[0]["baserevid"])
 
+    def test_insert_exact_repeat_is_idempotent_noop(self):
+        original = empty_archive.render_empty_channel_list({20: record(20)})
+        client = RegistryClient({"revid": 7, "content": original})
+
+        saved = asyncio.run(empty_archive.insert_record(
+            client, "Archive", record(20),
+        ))
+
+        # An identical record already present is a no-op: no edit is issued and
+        # the current page is returned unchanged.
+        self.assertEqual(client.edits, [])
+        self.assertEqual(saved["revid"], 7)
+        self.assertEqual(empty_archive.parse_empty_channel_list(saved["content"]), {20: record(20)})
+
+    def test_insert_conflicting_same_id_fails_closed(self):
+        original = empty_archive.render_empty_channel_list({20: record(20)})
+        client = RegistryClient({"revid": 7, "content": original})
+
+        # A different record under an already-recorded channel ID must never
+        # overwrite the immutable entry; the append-only registry fails closed.
+        with self.assertRaisesRegex(WikiError, "refuses to overwrite"):
+            asyncio.run(empty_archive.insert_record(
+                client, "Archive", record(20, name="cpt-239-renamed"),
+            ))
+        self.assertEqual(client.edits, [])
+
     def test_malformed_existing_registry_fails_closed(self):
         client = RegistryClient({"revid": 7, "content": "manual page"})
         with self.assertRaisesRegex(WikiError, "malformed"):
-            asyncio.run(empty_archive.upsert_record(
+            asyncio.run(empty_archive.insert_record(
                 client, "Archive", record(20),
             ))
         self.assertEqual(client.edits, [])

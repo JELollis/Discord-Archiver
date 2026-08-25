@@ -29,7 +29,7 @@ _EDIT_ATTEMPTS = 4
 
 
 def list_page_title(namespace: str = "Archive") -> str:
-    return f"{namespace}:Empty Channel List"
+    return f"{namespace}:Skipped"
 
 
 def entry_anchor(channel_id: int) -> str:
@@ -182,12 +182,27 @@ async def load_records(client, namespace: str) -> tuple[dict[int, dict], dict | 
     return records, page
 
 
-async def upsert_record(client, namespace: str, record: dict) -> dict:
-    """Atomically insert/update one record and verify it from MediaWiki."""
+async def insert_record(client, namespace: str, record: dict) -> dict:
+    """Append one immutable record and verify it from MediaWiki.
+
+    The Skipped registry is append-only: a channel ID that is already recorded is
+    never rewritten. Re-recording the *exact* same data is an idempotent no-op,
+    while any differing data for an existing channel ID fails closed rather than
+    silently overwriting the immutable record.
+    """
     record = make_record(**record)
     title = list_page_title(namespace)
     for attempt in range(_EDIT_ATTEMPTS):
         records, page = await load_records(client, namespace)
+        existing = records.get(record["channel_id"])
+        if existing is not None:
+            if existing == record:
+                # Idempotent: the immutable record already matches exactly.
+                return page
+            raise WikiError(
+                f"Skipped registry already holds a different record for channel "
+                f"{record['channel_id']}; the append-only list refuses to overwrite it"
+            )
         records[record["channel_id"]] = record
         content = render_empty_channel_list(records)
         try:

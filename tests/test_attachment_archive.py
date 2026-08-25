@@ -8,8 +8,31 @@ from attachment_archive import (
     AttachmentTooLargeError,
     create_zip_file,
     file_sha1_and_size,
+    select_reusable_upload,
     stage_discord_attachment,
 )
+
+
+class SelectReusableUploadTests(unittest.TestCase):
+    def test_direct_name_is_preferred_when_present(self):
+        manifest = {"123-9-chan-file.png": ("abc123", 42)}
+        self.assertEqual(
+            select_reusable_upload("123-9-chan-file.png", "123-9-chan-file_png.zip", manifest),
+            ("123-9-chan-file.png", False, "abc123", 42),
+        )
+
+    def test_zip_fallback_name_is_matched_and_flagged_zipped(self):
+        manifest = {"123-9-chan-file_py.zip": ("def456", 99)}
+        self.assertEqual(
+            select_reusable_upload("123-9-chan-file.py", "123-9-chan-file_py.zip", manifest),
+            ("123-9-chan-file_py.zip", True, "def456", 99),
+        )
+
+    def test_no_candidate_present_returns_none(self):
+        self.assertIsNone(
+            select_reusable_upload("a.png", "a_png.zip", {"unrelated.png": ("x", 1)})
+        )
+        self.assertIsNone(select_reusable_upload("a.png", "a_png.zip", {}))
 
 
 class FakeAttachment:

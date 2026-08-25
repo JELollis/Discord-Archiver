@@ -106,6 +106,28 @@ def create_zip_file(
         archive.write(source, arcname=safe_inner_name)
 
 
+def select_reusable_upload(
+    base_name: str,
+    zip_name: str,
+    manifest: dict[str, tuple[str, int]],
+) -> tuple[str, bool, str, int] | None:
+    """Pick the manifest entry, if any, an intact prior upload can reuse.
+
+    ``manifest`` maps a wiki filename to its recorded ``(sha1, size)``. An
+    attachment is stored under either its deterministic direct upload name or its
+    ZIP-fallback name, so this returns ``(candidate_name, zipped, sha1, size)``
+    for whichever of the two the manifest lists, or ``None`` when neither is
+    present. It only *selects* a candidate; the caller must still confirm the
+    wiki still holds those exact bytes before reusing them.
+    """
+    for candidate, zipped in ((base_name, False), (zip_name, True)):
+        entry = manifest.get(candidate)
+        if entry is not None:
+            sha1, size = entry
+            return candidate, zipped, sha1, size
+    return None
+
+
 def file_sha1_and_size(path: str | os.PathLike[str]) -> tuple[str, int]:
     """Return the MediaWiki-compatible SHA-1 and exact byte size of a file."""
     digest = hashlib.sha1()

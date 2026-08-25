@@ -17,6 +17,7 @@ from attachment_archive import (
     AttachmentTooLargeError,
     create_zip_file,
     file_sha1_and_size,
+    select_reusable_upload,
     stage_discord_attachment,
 )
 from discord_rate_limit import (
@@ -369,15 +370,69 @@ async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
     return messages, complete
 
 
-async def archive_attachments(client: MediaWikiClient, channel_name: str, messages: list) -> int:
+async def _reuse_archived_attachment(
+    client: MediaWikiClient,
+    channel_name: str,
+    message_id: int,
+    att: dict,
+    existing_manifest: dict[str, tuple[str, int]],
+) -> bool:
+    """Reuse an already-uploaded, still-intact wiki attachment instead of re-uploading.
+
+    Matches this attachment's deterministic direct name and its ZIP-fallback name
+    against the sealed manifest of the existing owned page, and confirms MediaWiki
+    still holds those exact bytes (filename + SHA-1 + size) before reusing it. On
+    reuse the wiki_* fields are populated so the rebuilt page and manifest are
+    byte-identical to a fresh upload.
+    """
+    base_name = discord_export.attachment_upload_name(
+        channel_name, message_id, att["id"], att["filename"]
+    )
+    zip_name = discord_export.zip_fallback_upload_name(base_name)
+    selection = select_reusable_upload(base_name, zip_name, existing_manifest)
+    if selection is None:
+        return False
+    candidate, zipped, manifest_sha1, manifest_size = selection
+    try:
+        info = await client.get_file_info(candidate)
+    except Exception as exc:
+        logging.warning(
+            "Could not check existing wiki attachment %r for #%s: %s",
+            candidate, channel_name, exc,
+        )
+        return False
+    if info is None or info["sha1"] != manifest_sha1 or info["size"] != manifest_size:
+        return False
+    att["wiki_filename"] = candidate
+    att["wiki_sha1"] = manifest_sha1
+    att["wiki_size"] = manifest_size
+    if zipped:
+        att["zipped"] = True
+    return True
+
+
+async def archive_attachments(
+    client: MediaWikiClient,
+    channel_name: str,
+    messages: list,
+    *,
+    existing_manifest: dict[str, tuple[str, int]] | None = None,
+) -> dict:
     """Upload each attachment to the wiki; annotate dicts with wiki_filename/error.
 
     Files whose type the wiki bans (e.g. .exe/.msi installers), or whose valid
     extension MediaWiki cannot reconcile with its detected MIME type, are
     re-uploaded inside a ZIP. This preserves the content without weakening
     MediaWiki's upload verification.
+
+    When ``existing_manifest`` (the sealed attachment manifest of the owning
+    page, mapping wiki filename -> (sha1, size)) is supplied, an attachment whose
+    archived copy is still intact is reused rather than downloaded and uploaded
+    again, so re-running ``/publish`` on an incomplete archive only transfers the
+    missing or mismatched files. Returns ``{"archived", "uploaded", "reused"}``.
     """
     uploaded = 0
+    reused = 0
     wiki_maximum = await client.max_upload_size()
     configured_maximum = WIKI_CONFIG["MEDIAWIKI_MAX_ATTACHMENT_BYTES"]
     maximum_size = min(wiki_maximum, configured_maximum)
@@ -393,6 +448,15 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
     for m in messages:
         for att in m["attachments"]:
             obj = att.pop("_obj", None)
+            if existing_manifest and await _reuse_archived_attachment(
+                client, channel_name, m["id"], att, existing_manifest
+            ):
+                reused += 1
+                logging.info(
+                    "Reusing verified wiki attachment for #%s msg %s: %r.",
+                    channel_name, m["id"], att["wiki_filename"],
+                )
+                continue
             if obj is None:
                 att["error"] = "attachment unavailable"
                 continue
@@ -461,7 +525,7 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
             except Exception as exc:
                 att["error"] = str(exc)
                 logging.warning("Attachment upload failed (#%s msg %s): %s", channel_name, m["id"], exc)
-    return uploaded
+    return {"archived": uploaded + reused, "uploaded": uploaded, "reused": reused}
 
 
 async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
@@ -1286,11 +1350,12 @@ async def delete(interaction: discord.Interaction, target_type: app_commands.Cho
 # ---- Command help registry (drives /help and the admin guide) ----
 COMMAND_HELP = {
     "publish": {
-        "summary": "Archive channel(s) to the wiki — a single channel, a whole category, or a name list.",
-        "usage": "/publish [channel:<#channel>] [category:<category>] [channels:<name,name,...>]",
+        "summary": "Archive channel(s) to the wiki — a channel, a whole category, category names, or a name list.",
+        "usage": "/publish [channel:<#channel>] [category:<category>] [categories:<name,name,...>] [channels:<name,name,...>]",
         "params": [
             "channel — (optional) a single text channel.",
             "category — (optional) archive every text channel in this category.",
+            "categories — (optional) comma-separated category names, processed in the order given.",
             "channels — (optional) comma-separated channel names to archive.",
             "With none given, archives the channel you run it in. Inputs combine and de-duplicate.",
         ],
@@ -1298,14 +1363,17 @@ COMMAND_HELP = {
             "/publish",
             "/publish channel:#cpt-257-summer-2023",
             "/publish category:Summer 2023 Archive",
+            "/publish categories:Summer 2024 Archive, Fall 2024 Archive, Spring 2025 Archive",
             "/publish channels:cpt-257-summer-2023, ist-201-summer-2023",
         ],
         "notes": (
-            "Run /archive first: writable channels are refused. For each channel, the bot reads parent + thread "
-            "history, uploads attachments, stages Archive:DEPT-NUM/Term Year (or Archive:Misc/<name>), posts the "
-            "link to #archives, then adds and verifies deletion clearance. Completely empty channels create no "
-            "individual stub; after a second empty check they are recorded on Archive:Empty Channel List. "
-            "Failures remain blocked. Requires Manage Channels."
+            "Run /archive first: any still-writable target aborts the whole request, and a missing or ambiguous "
+            "category name does too. Channels already archived and current are skipped untouched; incomplete "
+            "archives reuse intact uploads and existing #archives announcements instead of duplicating them. For "
+            "each new channel the bot reads parent + thread history, uploads attachments, stages "
+            "Archive:DEPT-NUM/Term Year (or Archive:Misc/<name>), posts the link to #archives, then adds and "
+            "verifies deletion clearance. Completely empty channels create no individual stub; after a second empty "
+            "check they are recorded on Archive:Skipped. Failures remain blocked. Requires Manage Channels."
         ),
     },
     "delete": {
@@ -1321,7 +1389,7 @@ COMMAND_HELP = {
         ],
         "notes": (
             "SAFETY: every non-empty text channel must have a current verified archive. A channel recorded on "
-            "Archive:Empty Channel List is accepted only if its parent and every thread are freshly verified empty. "
+            "Archive:Skipped is accepted only if its parent and every thread are freshly verified empty. "
             "Forum channels are unsupported and blocked, while voice/stage channels are allowed only when their "
             "persistent text chat is empty. A 60-second confirmation rechecks both current content and the "
             "requester's Manage Channels permission. Deletion is permanent."
@@ -1491,12 +1559,26 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
             )
         return result
 
-    uploaded = await archive_attachments(client, channel.name, messages)
     namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
     title = discord_export.make_page_title(channel.name, namespace)
+    # Fetch the owned canonical page BEFORE uploading so a re-publish of an
+    # incomplete archive can reuse still-intact attachments instead of resubmitting
+    # every file. Only a page whose integrity seal still validates is trusted as
+    # the reuse source; a tampered/broken page forces a full re-upload.
     canonical_page = await _require_owned_or_missing_page(
         client, title, channel.id, channel.name,
     )
+    existing_manifest = None
+    if canonical_page and discord_export.verify_canonical_content(canonical_page["content"]):
+        parsed_manifest = discord_export.parse_attachment_manifest(canonical_page["content"])
+        if parsed_manifest:
+            existing_manifest = {
+                name: (sha1, size) for name, sha1, size in parsed_manifest
+            }
+    attachment_stats = await archive_attachments(
+        client, channel.name, messages, existing_manifest=existing_manifest,
+    )
+    uploaded = attachment_stats["archived"]
     thread_names = {
         m["id"]: m["thread_header"]
         for m in messages
@@ -1648,6 +1730,8 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         "channel": channel, "ok": False, "ready": ready,
         "title": title, "url": wiki_page_url(title),
         "messages": meta["message_count"], "attachments": uploaded,
+        "uploaded_attachments": attachment_stats["uploaded"],
+        "reused_attachments": attachment_stats["reused"],
         "revid": page["revid"] if page else None,
         "complete": meta["complete"],
         "error": error,
@@ -1727,7 +1811,7 @@ async def finalize_empty_archive(client: MediaWikiClient, result: dict) -> None:
     if not still_empty:
         raise WikiError("channel received a message before empty-record finalisation")
 
-    saved = await empty_archive.upsert_record(
+    saved = await empty_archive.insert_record(
         client,
         WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"],
         record,
@@ -1741,10 +1825,11 @@ async def finalize_empty_archive(client: MediaWikiClient, result: dict) -> None:
 
 
 # ---- /publish command (single channel, a whole category, and/or a name list) ----
-@tree.command(name="publish", description="Archive channel(s) to the wiki: a channel, a category, or a name list.")
+@tree.command(name="publish", description="Archive channel(s) to the wiki: a channel, a category, category names, or a name list.")
 @app_commands.describe(
     channel="A single text channel to archive",
     category="Archive every text channel in this category",
+    categories="Comma-separated category names to archive, in the given order",
     channels="Comma-separated channel names to archive",
 )
 @app_commands.default_permissions(manage_channels=True)
@@ -1753,6 +1838,7 @@ async def publish(
     interaction: discord.Interaction,
     channel: discord.TextChannel | None = None,
     category: discord.CategoryChannel | None = None,
+    categories: str | None = None,
     channels: str | None = None,
 ):
     await interaction.response.defer(ephemeral=True)
@@ -1766,32 +1852,88 @@ async def publish(
         await interaction.followup.send("You need the Manage Channels permission to use `/publish`.", ephemeral=True)
         return
 
-    # Resolve the target set from any combination of the three inputs.
-    targets: list[discord.TextChannel] = []
-    selector_supplied = channel is not None or category is not None or bool(channels and channels.strip())
+    # ---- Resolve the ordered target set with a source label for each channel ----
+    # Entries are (channel, source_label); the label is the category a channel came
+    # from and only drives progress logging. Category-list order is preserved, and
+    # each category's channels follow their Discord position order.
+    ordered: list[tuple[discord.TextChannel, str]] = []
+    selector_supplied = (
+        channel is not None
+        or category is not None
+        or bool(categories and categories.strip())
+        or bool(channels and channels.strip())
+    )
     if channel is not None:
-        targets.append(channel)
+        ordered.append((channel, channel.category.name if channel.category else ""))
     if category is not None:
-        targets.extend(c for c in category.text_channels)
-    if channels:
-        wanted = {n.strip().lstrip("#").casefold() for n in channels.split(",") if n.strip()}
-        found = {c.name.casefold() for c in guild.text_channels}
-        targets.extend(c for c in guild.text_channels if c.name.casefold() in wanted)
-        missing = [n for n in wanted if n not in found]
-        if missing:
-            await interaction.followup.send(
-                "⚠️ Not found: " + ", ".join(f"`{n}`" for n in sorted(missing)), ephemeral=True)
-        if not targets:
-            await interaction.followup.send("No supplied channel names matched; nothing was published.", ephemeral=True)
-            return
-    if not targets and not selector_supplied and isinstance(interaction.channel, discord.TextChannel):
-        targets.append(interaction.channel)  # default: the current channel
+        for member in category.text_channels:
+            ordered.append((member, category.name))
 
-    # De-duplicate, preserving order.
-    seen: set[int] = set()
-    targets = [t for t in targets if not (t.id in seen or seen.add(t.id))]
+    # Category name list: resolve case-insensitively. A missing OR ambiguous
+    # (duplicate) category name aborts the WHOLE request before any wiki work,
+    # so a typo can never publish a partial, surprising subset.
+    if categories:
+        wanted_categories = discord_export.parse_name_list(categories)
+        resolution_errors: list[str] = []
+        for name in wanted_categories:
+            matches = [cat for cat in guild.categories if cat.name.casefold() == name]
+            if not matches:
+                resolution_errors.append(f"no category named `{name}`")
+            elif len(matches) > 1:
+                resolution_errors.append(f"`{name}` is ambiguous — {len(matches)} categories share that name")
+            else:
+                for member in matches[0].text_channels:
+                    ordered.append((member, matches[0].name))
+        if resolution_errors:
+            await interaction.followup.send(
+                "❌ Category list could not be resolved — nothing was published:\n"
+                + "\n".join(f"• {err}" for err in resolution_errors),
+                ephemeral=True,
+            )
+            return
+
+    # Channel name list. Unmatched names are reported (non-fatal) alongside the
+    # final summary rather than aborting names that did resolve.
+    missing_channel_names: list[str] = []
+    if channels:
+        wanted = set(discord_export.parse_name_list(channels))
+        found = {c.name.casefold() for c in guild.text_channels}
+        for member in guild.text_channels:
+            if member.name.casefold() in wanted:
+                ordered.append((member, member.category.name if member.category else ""))
+        missing_channel_names = sorted(wanted - found)
+
+    # Default to the current channel only when NO selector was supplied.
+    if not ordered and not selector_supplied and isinstance(interaction.channel, discord.TextChannel):
+        current = interaction.channel
+        ordered.append((current, current.category.name if current.category else ""))
+
+    # De-duplicate by channel id, preserving first occurrence and its label.
+    seen_ids: set[int] = set()
+    targets: list[tuple[discord.TextChannel, str]] = []
+    for member, label in ordered:
+        if member.id not in seen_ids:
+            seen_ids.add(member.id)
+            targets.append((member, label))
     if not targets:
-        await interaction.followup.send("No text channels to publish.", ephemeral=True)
+        note = ""
+        if missing_channel_names:
+            note = " Unmatched names: " + ", ".join(f"`{n}`" for n in missing_channel_names)
+        await interaction.followup.send("No text channels to publish." + note, ephemeral=True)
+        return
+
+    # ---- Preflight: every target must be locked read-only before any wiki work ----
+    # A single writable target aborts the whole request; publishing a channel that
+    # can still receive messages is racy and could mark uncaptured history deletable.
+    writable = [member for member, _label in targets if not _is_locked_readonly(member)]
+    if writable:
+        shown = ", ".join(f"#{member.name}" for member in writable[:40])
+        overflow = "" if len(writable) <= 40 else f" …(+{len(writable) - 40} more)"
+        await interaction.followup.send(
+            "❌ These channels are still writable — run `/archive` to lock them first. "
+            "Nothing was published:\n" + shown + overflow,
+            ephemeral=True,
+        )
         return
 
     try:
@@ -1800,38 +1942,92 @@ async def publish(
         await interaction.followup.send(f"❌ Wiki unavailable: {exc}", ephemeral=True)
         return
 
+    # Read the bot's own #archives announcements once so an already-announced
+    # archive is reused instead of re-announced. Only the bot's messages are
+    # trusted; a user-authored lookalike must never satisfy the announcement gate.
+    # If history cannot be fully read, fail closed: channels that would need a
+    # fresh announcement are left unverified rather than risking a duplicate.
+    archives_channel = discord.utils.get(guild.text_channels, name="archives")
+    # Collect the exact URL tokens the bot has already announced. Whitespace-token
+    # membership (not substring) is required so e.g. #empty-channel-12 cannot match
+    # a #empty-channel-123 announcement; archive URLs never contain whitespace.
+    announced_urls: set[str] = set()
+    announcements_readable = True
+    if archives_channel is not None:
+        bot_id = bot.user.id if bot.user else None
+        try:
+            async for message in archives_channel.history(limit=None):
+                if bot_id is not None and message.author.id == bot_id and message.content:
+                    announced_urls.update(message.content.split())
+        except Exception as exc:
+            logging.warning("Could not read #archives history; failing closed on announcements: %s", exc)
+            announcements_readable = False
+
+    total = len(targets)
     await interaction.followup.send(
-        f"⏳ Publishing {len(targets)} channel(s)… results will post to #archives as they finish.",
+        f"⏳ Reconciling {total} channel(s) with the wiki… results post to #archives as they finish.",
         ephemeral=True,
     )
-    archives_channel = discord.utils.get(guild.text_channels, name="archives")
 
     results = []
-    for ch in targets:
+    counts = {"unchanged": 0, "published": 0, "empty": 0, "failed": 0}
+    for index, (ch, label) in enumerate(targets, 1):
+        label_note = f" [{label}]" if label else ""
+        logging.info("Publish %d/%d%s: reconciling #%s.", index, total, label_note, ch.name)
+
+        # Fast path: an already-verified, current archive is left completely
+        # untouched — no capture, upload, edit, or announcement.
+        try:
+            already_archived = await is_channel_archived(client, ch)
+        except Exception as exc:
+            logging.warning("Archive fast-path check failed for #%s: %s", ch.name, exc)
+            already_archived = False
+        if already_archived:
+            counts["unchanged"] += 1
+            logging.info("Publish %d/%d%s: #%s already archived and current — unchanged.", index, total, label_note, ch.name)
+            results.append({"channel": ch, "ok": True, "unchanged": True, "label": label})
+            continue
+
         try:
             result = await publish_channel_to_wiki(client, ch)
         except Exception as exc:
             logging.exception("publish failed for #%s", ch.name)
             result = {"channel": ch, "ok": False, "error": str(exc)}
+        result["label"] = label
         results.append(result)
+
         if result.get("ready") and archives_channel is not None:
-            try:
+            url = result.get("url", "")
+            already_announced = announcements_readable and bool(url) and url in announced_urls
+            announced_ok = already_announced
+            if already_announced:
+                result["announcement_reused"] = True
+                logging.info("Publish %d/%d%s: reusing existing #archives announcement for #%s.", index, total, label_note, ch.name)
+            elif not announcements_readable:
+                result["announcement_error"] = "could not read #archives history to avoid a duplicate announcement"
+                result["error"] = result["announcement_error"]
+            else:
                 if result.get("empty"):
                     announcement = (
                         f"📭 Recorded empty **#{ch.name}** — verified 0 messages; "
-                        f"no channel page created: {result['url']}"
+                        f"no channel page created: {url}"
                     )
                 else:
                     announcement = (
                         f"📚 Archived **#{ch.name}** — {result['messages']} messages, "
-                        f"{result['attachments']} attachment(s): {result['url']}"
+                        f"{result['attachments']} attachment(s): {url}"
                     )
-                await archives_channel.send(announcement)
-            except Exception as exc:
-                logging.exception("Failed to post archive URL to #archives")
-                result["announcement_error"] = f"could not post the archive URL to #archives: {exc}"
-                result["error"] = result["announcement_error"]
-            else:
+                try:
+                    await archives_channel.send(announcement)
+                except Exception as exc:
+                    logging.exception("Failed to post archive URL to #archives")
+                    result["announcement_error"] = f"could not post the archive URL to #archives: {exc}"
+                    result["error"] = result["announcement_error"]
+                else:
+                    announced_ok = True
+                    # Guard against a duplicate later in this same batch.
+                    announced_urls.add(url)
+            if announced_ok:
                 try:
                     # The deletion marker is written only after the announcement.
                     # If finalisation fails, the staged page remains incomplete and
@@ -1847,34 +2043,58 @@ async def publish(
         elif result.get("ready"):
             result["announcement_error"] = "#archives channel was not found"
             result["error"] = result["announcement_error"]
+
         # Do not retain large staged/final page bodies in the summary list.
-        result.pop("_final_text", None)
-        result.pop("_stream_boundaries", None)
-        result.pop("_part_manifest", None)
-        result.pop("_empty_record", None)
+        for key in ("_final_text", "_stream_boundaries", "_part_manifest", "_attachment_manifest", "_empty_record"):
+            result.pop(key, None)
+
+        if result.get("ok") and result.get("empty"):
+            counts["empty"] += 1
+            logging.info("Publish %d/%d%s: #%s recorded empty on the Skipped list.", index, total, label_note, ch.name)
+        elif result.get("ok"):
+            counts["published"] += 1
+            logging.info(
+                "Publish %d/%d%s: #%s published (%d msgs, %d attachment(s): %d reused, %d uploaded)%s.",
+                index, total, label_note, ch.name, result.get("messages", 0),
+                result.get("attachments", 0), result.get("reused_attachments", 0),
+                result.get("uploaded_attachments", 0),
+                " via reused announcement" if result.get("announcement_reused") else "",
+            )
+        else:
+            counts["failed"] += 1
+            logging.warning("Publish %d/%d%s: #%s FAILED — %s", index, total, label_note, ch.name, result.get("error", "unverified"))
+
+    logging.info(
+        "Publish complete: %d unchanged, %d published/repaired, %d empty recorded, %d failed (of %d).",
+        counts["unchanged"], counts["published"], counts["empty"], counts["failed"], total,
+    )
 
     ok = [r for r in results if r.get("ok")]
     bad = [r for r in results if not r.get("ok")]
-    lines = [f"✅ Published and verified {len(ok)}/{len(results)} channel(s)."]
-    for r in ok[:12]:
-        if r.get("empty"):
-            lines.append(
-                f"• #{r['channel'].name} → <{r['url']}> (empty; no channel page)"
-            )
+    lines = [
+        f"✅ Reconciled {total} channel(s): {counts['unchanged']} unchanged, "
+        f"{counts['published']} published/repaired, {counts['empty']} empty recorded, "
+        f"{counts['failed']} failed."
+    ]
+    if missing_channel_names:
+        lines.append("⚠️ Unmatched channel names: " + ", ".join(f"`{n}`" for n in missing_channel_names))
+    for r in ok[:15]:
+        ch = r["channel"]
+        if r.get("unchanged"):
+            lines.append(f"• #{ch.name} — already archived (unchanged)")
+        elif r.get("empty"):
+            lines.append(f"• #{ch.name} → <{r['url']}> (empty; recorded on the Skipped list)")
         else:
-            lines.append(f"• #{r['channel'].name} → <{r['url']}> ({r['messages']} msgs)")
+            reused = " (reused announcement)" if r.get("announcement_reused") else ""
+            lines.append(f"• #{ch.name} → <{r['url']}> ({r['messages']} msgs){reused}")
         if r.get("announcement_error"):
             lines.append(f"  ⚠️ {r['announcement_error']}")
-    if len(ok) > 12:
-        lines.append(f"• …and {len(ok) - 12} more (see #archives)")
+    if len(ok) > 15:
+        lines.append(f"• …and {len(ok) - 15} more OK (see #archives)")
     if bad:
         lines.append(f"⚠️ **Failed/unverified ({len(bad)}) — do NOT delete these:**")
-        for r in bad[:12]:
+        for r in bad:
             lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
-        if len(bad) > 12:
-            lines.append(f"• Additional failures ({len(bad) - 12}):")
-            for r in bad[12:]:
-                lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
     try:
         # Discord limits a message to 2000 characters; paginate rather than
         # silently dropping failure names after the first chunk.

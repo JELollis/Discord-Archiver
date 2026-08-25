@@ -158,7 +158,7 @@ class ArchiveBotSourceTests(unittest.TestCase):
             ):
                 continue
             calls[node.func.attr] = node.lineno
-        self.assertLess(calls["is_completely_empty"], calls["upsert_record"])
+        self.assertLess(calls["is_completely_empty"], calls["insert_record"])
 
     def test_missing_channel_page_can_use_verified_empty_registry(self):
         tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
@@ -169,6 +169,66 @@ class ArchiveBotSourceTests(unittest.TestCase):
             and node.func.id == "_is_recorded_channel_still_empty"
             for node in ast.walk(function)
         ))
+
+    @staticmethod
+    def _first_named_call_line(function, name):
+        return min(
+            (
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == name
+            ),
+            default=None,
+        )
+
+    def test_publish_exposes_category_name_list_option(self):
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish")
+        arg_names = {arg.arg for arg in function.args.args}
+        self.assertIn("categories", arg_names)
+
+    def test_publish_validates_locks_before_any_wiki_work(self):
+        """No wiki client/edit may run until every target's lock is validated."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish")
+        lock_line = self._first_named_call_line(function, "_is_locked_readonly")
+        wiki_client_line = self._first_named_call_line(function, "get_wiki_client")
+        publish_channel_line = self._first_named_call_line(function, "publish_channel_to_wiki")
+        self.assertIsNotNone(lock_line, "publish must preflight channel locks")
+        self.assertIsNotNone(wiki_client_line)
+        self.assertLess(lock_line, wiki_client_line)
+        self.assertLess(lock_line, publish_channel_line)
+
+    def test_publish_uses_archive_fast_path_before_capturing(self):
+        """is_channel_archived must short-circuit before publish_channel_to_wiki."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish")
+        fast_path_line = self._first_named_call_line(function, "is_channel_archived")
+        publish_channel_line = self._first_named_call_line(function, "publish_channel_to_wiki")
+        self.assertIsNotNone(fast_path_line, "publish must call is_channel_archived")
+        self.assertLess(fast_path_line, publish_channel_line)
+
+    def test_publish_only_trusts_bot_authored_announcements(self):
+        """Announcement reuse must gate on the bot's own authorship of #archives posts."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish")
+        reads_message_author = any(
+            isinstance(node, ast.Attribute)
+            and node.attr == "author"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "message"
+            for node in ast.walk(function)
+        )
+        references_bot_user = any(
+            isinstance(node, ast.Attribute)
+            and node.attr == "user"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "bot"
+            for node in ast.walk(function)
+        )
+        self.assertTrue(reads_message_author and references_bot_user)
 
 
 if __name__ == "__main__":

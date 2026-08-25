@@ -250,5 +250,29 @@ class DiscordExportTests(unittest.TestCase):
             )
 
 
+class ParseNameListTests(unittest.TestCase):
+    def test_trims_casefolds_and_preserves_input_order(self):
+        self.assertEqual(
+            discord_export.parse_name_list("  Summer 2024 Archive , Fall 2024 Archive "),
+            ["summer 2024 archive", "fall 2024 archive"],
+        )
+
+    def test_deduplicates_case_insensitively_keeping_first_position(self):
+        self.assertEqual(
+            discord_export.parse_name_list("Fall 2024, spring 2025, FALL 2024, Spring 2025"),
+            ["fall 2024", "spring 2025"],
+        )
+
+    def test_drops_empty_entries_and_leading_hash(self):
+        self.assertEqual(
+            discord_export.parse_name_list(",  , #cpt-257 , ,#IST-201,"),
+            ["cpt-257", "ist-201"],
+        )
+
+    def test_none_and_blank_yield_empty_list(self):
+        self.assertEqual(discord_export.parse_name_list(None), [])
+        self.assertEqual(discord_export.parse_name_list("   , ,"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

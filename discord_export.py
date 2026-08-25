@@ -310,6 +310,24 @@ def sanitize_filename(name: str) -> str:
     return f"{stem}{suffix}"
 
 
+def parse_name_list(raw: str | None) -> list[str]:
+    """Split a comma-separated option into ordered, unique, casefolded names.
+
+    Trims surrounding whitespace and a leading ``#`` from each entry, drops empty
+    entries, and de-duplicates case-insensitively while preserving the order the
+    user typed. Used for the ``/publish`` category and channel name lists so a
+    single validated parser governs both.
+    """
+    seen: set[str] = set()
+    names: list[str] = []
+    for token in (raw or "").split(","):
+        name = token.strip().lstrip("#").strip().casefold()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
 _CHANNEL_PATTERN = re.compile(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", re.IGNORECASE)
 
 
