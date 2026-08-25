@@ -12,6 +12,7 @@ import tempfile
 
 from wiki_client import MediaWikiClient, WikiError, load_config
 import discord_export
+import empty_archive
 from attachment_archive import (
     AttachmentTooLargeError,
     create_zip_file,
@@ -84,6 +85,14 @@ def wiki_page_url(title: str) -> str:
     """Public index.php URL for a wiki page title."""
     base = WIKI_CONFIG["MEDIAWIKI_API_URL"].rsplit("/api.php", 1)[0]
     return f"{base}/index.php/" + urllib.parse.quote(title.replace(" ", "_"), safe="/:")
+
+
+def empty_channel_list_url(channel_id: int) -> str:
+    """Return the shared empty-channel registry URL anchored to one record."""
+    title = empty_archive.list_page_title(
+        WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+    )
+    return f"{wiki_page_url(title)}#{empty_archive.entry_anchor(channel_id)}"
 
 
 def _paginate_lines(lines: list[str], limit: int = 1900) -> list[str]:
@@ -257,6 +266,39 @@ async def _require_owned_or_missing_page(
     return page
 
 
+async def _empty_record_for_channel(
+    client: MediaWikiClient, channel: discord.TextChannel
+) -> dict | None:
+    """Return this channel's shared empty record, rejecting an ID collision."""
+    namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+    records, _page = await empty_archive.load_records(client, namespace)
+    record = records.get(channel.id)
+    if record and record["guild_id"] != channel.guild.id:
+        raise WikiError(
+            f"empty-channel registry entry for {channel.id} belongs to another Discord guild"
+        )
+    return record
+
+
+async def _is_recorded_channel_still_empty(
+    client: MediaWikiClient, channel: discord.TextChannel
+) -> bool:
+    """Verify a shared-list record plus the channel's current empty state."""
+    try:
+        record = await _empty_record_for_channel(client, channel)
+        if record is None:
+            return False
+        if not _is_locked_readonly(channel):
+            return False
+        return await empty_archive.is_completely_empty(channel, _iter_threads)
+    except Exception as exc:
+        logging.warning(
+            "Could not verify empty-channel record for #%s; blocking deletion: %s",
+            channel.name, exc,
+        )
+        return False
+
+
 async def _archive_parts_match(
     client: MediaWikiClient,
     title: str,
@@ -423,7 +465,7 @@ async def archive_attachments(client: MediaWikiClient, channel_name: str, messag
 
 
 async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
-    """True if a verified archive page for this channel exists on the wiki.
+    """True if a current archive page or verified-empty record exists.
 
     Voice/stage channels are exempt only after their persistent text chat is
     verified empty. Forum and other unsupported message-bearing channels are
@@ -450,7 +492,7 @@ async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
     title = discord_export.make_page_title(channel.name, WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"])
     page = await client.get_page(title)
     if not page:
-        return False
+        return await _is_recorded_channel_still_empty(client, channel)
     if not discord_export.verify_canonical_content(page["content"]):
         logging.warning("Canonical archive content changed for #%s; blocking deletion.", channel.name)
         return False
@@ -1261,8 +1303,9 @@ COMMAND_HELP = {
         "notes": (
             "Run /archive first: writable channels are refused. For each channel, the bot reads parent + thread "
             "history, uploads attachments, stages Archive:DEPT-NUM/Term Year (or Archive:Misc/<name>), posts the "
-            "link to #archives, then adds and verifies deletion clearance. Failures remain blocked. Requires "
-            "Manage Channels."
+            "link to #archives, then adds and verifies deletion clearance. Completely empty channels create no "
+            "individual stub; after a second empty check they are recorded on Archive:Empty Channel List. "
+            "Failures remain blocked. Requires Manage Channels."
         ),
     },
     "delete": {
@@ -1277,10 +1320,11 @@ COMMAND_HELP = {
             "/delete target_type:Category targets:Summer 2023 Archive",
         ],
         "notes": (
-            "SAFETY: every text channel must have a current verified archive; forum channels are unsupported and "
-            "blocked, while voice/stage channels are allowed only when their persistent text chat is empty. A "
-            "60-second confirmation rechecks both current content and the requester's Manage Channels permission. "
-            "Deletion is permanent."
+            "SAFETY: every non-empty text channel must have a current verified archive. A channel recorded on "
+            "Archive:Empty Channel List is accepted only if its parent and every thread are freshly verified empty. "
+            "Forum channels are unsupported and blocked, while voice/stage channels are allowed only when their "
+            "persistent text chat is empty. A 60-second confirmation rechecks both current content and the "
+            "requester's Manage Channels permission. Deletion is permanent."
         ),
     },
     "publish_help_placeholder": None,  # (kept intentionally out; see below)
@@ -1410,13 +1454,49 @@ async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.Text
         raise WikiError("channel is still writable — run /archive to lock it read-only before publishing")
     capture_started = datetime.datetime.now(datetime.timezone.utc)
     messages, capture_complete = await capture_channel(channel)
+    real_messages = [m for m in messages if not m.get("thread_header")]
+
+    # A completely verified empty channel has no content worth a dedicated wiki
+    # stub. Record it on the shared list only after the required #archives
+    # announcement and a second live emptiness check. If enumeration failed, do
+    # not create either a misleading empty record or an incomplete blank page.
+    if not real_messages:
+        if not capture_complete:
+            raise WikiError(
+                "channel appears empty, but parent/thread history could not be fully verified"
+            )
+        existing_record = await _empty_record_for_channel(client, channel)
+        title = empty_archive.list_page_title(
+            WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+        )
+        result = {
+            "channel": channel,
+            "empty": True,
+            "ok": existing_record is not None,
+            "ready": existing_record is None,
+            "title": title,
+            "url": empty_channel_list_url(channel.id),
+            "messages": 0,
+            "attachments": 0,
+            "complete": True,
+            "error": None,
+        }
+        if existing_record is None:
+            result["_empty_record"] = empty_archive.make_record(
+                guild_id=channel.guild.id,
+                channel_id=channel.id,
+                channel_name=channel.name,
+                category_name=channel.category.name if channel.category else "",
+                verified_at=_format_capture_time(capture_started),
+            )
+        return result
+
     uploaded = await archive_attachments(client, channel.name, messages)
     namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
     title = discord_export.make_page_title(channel.name, namespace)
     canonical_page = await _require_owned_or_missing_page(
         client, title, channel.id, channel.name,
     )
-    real_messages = [m for m in messages if not m.get("thread_header")]
     thread_names = {
         m["id"]: m["thread_header"]
         for m in messages
@@ -1632,6 +1712,34 @@ async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
     result["error"] = None
 
 
+async def finalize_empty_archive(client: MediaWikiClient, result: dict) -> None:
+    """Record an announced empty channel after rechecking every message stream."""
+    record = result.pop("_empty_record", None)
+    channel = result["channel"]
+    if not record:
+        raise WikiError("empty channel was not ready for finalisation")
+    if not _is_locked_readonly(channel):
+        raise WikiError("empty channel is no longer locked read-only")
+    try:
+        still_empty = await empty_archive.is_completely_empty(channel, _iter_threads)
+    except Exception as exc:
+        raise WikiError(f"could not re-verify empty channel history: {exc}") from exc
+    if not still_empty:
+        raise WikiError("channel received a message before empty-record finalisation")
+
+    saved = await empty_archive.upsert_record(
+        client,
+        WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"],
+        record,
+    )
+    saved_records = empty_archive.parse_empty_channel_list(saved.get("content", ""))
+    if not saved_records or saved_records.get(channel.id) != record:
+        raise WikiError("empty-channel record failed final read-back verification")
+    result["revid"] = saved["revid"]
+    result["ok"] = True
+    result["error"] = None
+
+
 # ---- /publish command (single channel, a whole category, and/or a name list) ----
 @tree.command(name="publish", description="Archive channel(s) to the wiki: a channel, a category, or a name list.")
 @app_commands.describe(
@@ -1708,10 +1816,17 @@ async def publish(
         results.append(result)
         if result.get("ready") and archives_channel is not None:
             try:
-                await archives_channel.send(
-                    f"📚 Archived **#{ch.name}** — {result['messages']} messages, "
-                    f"{result['attachments']} attachment(s): {result['url']}"
-                )
+                if result.get("empty"):
+                    announcement = (
+                        f"📭 Recorded empty **#{ch.name}** — verified 0 messages; "
+                        f"no channel page created: {result['url']}"
+                    )
+                else:
+                    announcement = (
+                        f"📚 Archived **#{ch.name}** — {result['messages']} messages, "
+                        f"{result['attachments']} attachment(s): {result['url']}"
+                    )
+                await archives_channel.send(announcement)
             except Exception as exc:
                 logging.exception("Failed to post archive URL to #archives")
                 result["announcement_error"] = f"could not post the archive URL to #archives: {exc}"
@@ -1721,7 +1836,10 @@ async def publish(
                     # The deletion marker is written only after the announcement.
                     # If finalisation fails, the staged page remains incomplete and
                     # `/delete` continues to block it without a compensating edit.
-                    await finalize_archive(client, result)
+                    if result.get("empty"):
+                        await finalize_empty_archive(client, result)
+                    else:
+                        await finalize_archive(client, result)
                 except Exception as exc:
                     logging.exception("Failed to finalise archive for #%s", ch.name)
                     result["error"] = f"announcement posted, but final verification failed: {exc}"
@@ -1733,12 +1851,18 @@ async def publish(
         result.pop("_final_text", None)
         result.pop("_stream_boundaries", None)
         result.pop("_part_manifest", None)
+        result.pop("_empty_record", None)
 
     ok = [r for r in results if r.get("ok")]
     bad = [r for r in results if not r.get("ok")]
     lines = [f"✅ Published and verified {len(ok)}/{len(results)} channel(s)."]
     for r in ok[:12]:
-        lines.append(f"• #{r['channel'].name} → <{r['url']}> ({r['messages']} msgs)")
+        if r.get("empty"):
+            lines.append(
+                f"• #{r['channel'].name} → <{r['url']}> (empty; no channel page)"
+            )
+        else:
+            lines.append(f"• #{r['channel'].name} → <{r['url']}> ({r['messages']} msgs)")
         if r.get("announcement_error"):
             lines.append(f"  ⚠️ {r['announcement_error']}")
     if len(ok) > 12:

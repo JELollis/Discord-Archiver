@@ -7,6 +7,14 @@ ARCHIVE_BOT_PATH = Path(__file__).resolve().parents[1] / "Archive_Bot.py"
 
 
 class ArchiveBotSourceTests(unittest.TestCase):
+    @staticmethod
+    def _async_function(tree, name):
+        return next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == name
+        )
+
     def test_extend_is_not_given_an_async_generator(self):
         """Reject the runtime-invalid ``items.extend(x for x if await ...)`` pattern."""
         tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
@@ -110,6 +118,56 @@ class ArchiveBotSourceTests(unittest.TestCase):
             and isinstance(label.values[0], ast.Constant)
             and label.values[0].value.startswith("delete ")
             for label in labels
+        ))
+
+    def test_empty_publish_short_circuits_before_upload_or_page_creation(self):
+        """A zero-message capture must never reach the per-channel wiki path."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish_channel_to_wiki")
+        empty_branch = next(
+            node
+            for node in function.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.UnaryOp)
+            and isinstance(node.test.op, ast.Not)
+            and isinstance(node.test.operand, ast.Name)
+            and node.test.operand.id == "real_messages"
+        )
+        calls = {
+            node.func.id: node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"archive_attachments", "_require_owned_or_missing_page"}
+        }
+        self.assertLess(empty_branch.lineno, calls["archive_attachments"])
+        self.assertLess(empty_branch.lineno, calls["_require_owned_or_missing_page"])
+        self.assertTrue(any(isinstance(node, ast.Return) for node in empty_branch.body))
+
+    def test_empty_finalization_rechecks_before_registry_write(self):
+        """The announcement-to-finalize window must not hide a newly posted message."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "finalize_empty_archive")
+        calls = {}
+        for node in ast.walk(function):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "empty_archive"
+            ):
+                continue
+            calls[node.func.attr] = node.lineno
+        self.assertLess(calls["is_completely_empty"], calls["upsert_record"])
+
+    def test_missing_channel_page_can_use_verified_empty_registry(self):
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "is_channel_archived")
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_is_recorded_channel_still_empty"
+            for node in ast.walk(function)
         ))
 
 

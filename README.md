@@ -6,6 +6,8 @@ MediaWiki** before they are deleted.
 
 The bot captures a channel's full history, uploads its attachments, publishes a wiki page, and
 **revalidates the saved page, split parts, files, and thread names** before the channel can be removed.
+Channels verified completely empty are recorded on one sealed `Archive:Empty Channel List` page instead of
+creating individual blank archive stubs.
 
 ---
 
@@ -15,10 +17,11 @@ The bot captures a channel's full history, uploads its attachments, publishes a 
   terms into read-only archive categories.
 - **Wiki archiving** — copy a Discord text channel to the wiki as a formatted page (authors,
   timestamps, message text with mentions resolved, attachments, reply links), with read-back
-  verification and a link posted to `#archives`.
+  verification and a link posted to `#archives`; verified empty channels are added to a shared list.
 - **Guarded deletion** — text channels require a current integrity-sealed wiki archive whose pages,
-  attachments, thread names, and message boundaries still match; unsupported message channels are
-  blocked, and voice/stage channels must have empty persistent text chat.
+  attachments, thread names, and message boundaries still match, or a sealed shared-list entry plus a
+  fresh empty parent/thread check; unsupported message channels are blocked, and voice/stage channels
+  must have empty persistent text chat.
 - **Private wiki with Discord SSO** — the wiki is readable only by verified members, logging in with
   Discord via Authentik (OpenID Connect).
 
@@ -47,6 +50,7 @@ Admin (Discord)                         Members (browser / mobile)
 | `wiki_client.py` | Async MediaWiki API client (BotPassword login, edit, upload, read-back verify). |
 | `attachment_archive.py` | Bounded-memory Discord attachment staging, ZIP fallback, and digest helpers. |
 | `discord_export.py` | Renders a captured channel into safe MediaWiki wikitext (mention resolution, escaping, page-title mapping). |
+| `empty_archive.py` | Sealed shared empty-channel registry, atomic updates, and live parent/thread emptiness verification. |
 | `Archive_Bot2.py` | Previous bot version, kept for reference/rollback. |
 | `archive.py`, `roles_generator.py`, `quick_update.py` | Older/utility scripts. |
 
@@ -54,7 +58,7 @@ Admin (Discord)                         Members (browser / mobile)
 
 | Command | What it does |
 |---|---|
-| `/publish [channel] [category] [channels]` | Archive a read-only channel, category, or channel list to the wiki (stage → post link → finalize → verify). |
+| `/publish [channel] [category] [channels]` | Archive a read-only channel, category, or channel list (empty channels go to the shared list without a stub). |
 | `/wiki_status` | Check the wiki connection and the bot's wiki permissions. |
 | `/delete target_type targets` | Permanently delete channels/categories (confirmation + requires a verified archive). |
 | `/archive term year` | Move a term's channels into a read-only Discord archive category. |
@@ -65,7 +69,9 @@ Admin (Discord)                         Members (browser / mobile)
 Command parameters and safety behavior are also available through the bot's `/help` command.
 
 The required retirement workflow is `/archive` → `/publish` → `/delete`. `/publish` refuses writable
-channels, and `/delete` revalidates the parent channel and every thread immediately before removal.
+channels, and `/delete` revalidates the parent channel and every thread immediately before removal. An empty
+channel is written to `Archive:Empty Channel List` only after its `#archives` announcement and a second complete
+empty check. Repeated publishes reuse its immutable channel-ID record rather than creating duplicates.
 Discord channel/category deletions performed by `/delete` are globally serialized with at least five seconds
 between requests. If Discord returns HTTP 429, the bot honors the documented `Retry-After` value with a
 total cooldown of the JSON `retry_after` value rounded up to the next second, plus one extra second. The
@@ -76,6 +82,8 @@ complete 429 JSON response is written to the bot log before the retry wait begin
 Course channels map to `Archive:DEPT-NUM/Term Year` (e.g. `cpt-257-summer-2023` →
 `Archive:CPT-257/Summer 2023`). Channels that don't match the `dept-num-term-year` pattern are archived
 under `Archive:Misc/<name>`. Each message gets a stable anchor so links can target a specific message.
+Completely empty channels create neither page; their guild ID, channel ID, name, category, and verification
+timestamp are stored in the sealed `Archive:Empty Channel List` table.
 
 ## Configuration
 
