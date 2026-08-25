@@ -32,3 +32,4 @@ wiki.env
 
 # Claude Code session dir
 /.claude/
+HANDOFF.md
