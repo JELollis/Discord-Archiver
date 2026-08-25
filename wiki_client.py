@@ -69,15 +69,27 @@ class WikiError(Exception):
 
     @property
     def is_file_type_rejection(self) -> bool:
-        """Whether preserving the upload inside a ZIP is a safe fallback."""
-        return (
-            self.code == "filetype-banned"
-            or self.has_detail("filetype-mime-mismatch")
-            # Preserve compatibility with custom/older callers that only put the
-            # MediaWiki error token in the exception message.
-            or "filetype-banned" in str(self)
-            or "filetype-mime-mismatch" in str(self)
-        )
+        """Whether preserving the upload inside a ZIP is a safe fallback.
+
+        Covers the several ways MediaWiki refuses a file by type or name, all of
+        which a ZIP resolves because the archive's own name/extension/MIME are
+        accepted while the original bytes are preserved unchanged:
+        - ``filetype-banned``      — the extension is on the deny list (e.g. .exe)
+        - ``filetype-mime-mismatch`` — extension vs detected MIME disagree
+        - ``filetype-badmime``     — the detected MIME itself is not allowed
+          (e.g. a .js served as text/html, a .zip detected as application/java)
+        - ``illegal-filename``     — the filename/extension is not permitted
+          (seen on the chunked path for .exe/.iso/.mkv)
+        """
+        markers = ("filetype-banned", "filetype-mime-mismatch", "filetype-badmime")
+        if self.code in ("filetype-banned", "illegal-filename"):
+            return True
+        if any(self.has_detail(marker) for marker in markers):
+            return True
+        # Preserve compatibility with custom/older callers that only put the
+        # MediaWiki error token in the exception message.
+        text = str(self)
+        return any(marker in text for marker in markers) or "illegal-filename" in text
 
 
 class UnexpectedResponseError(Exception):

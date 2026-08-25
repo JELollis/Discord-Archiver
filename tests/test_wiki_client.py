@@ -397,6 +397,38 @@ class WikiClientTests(unittest.TestCase):
         self.assertTrue(raised.exception.has_detail("filetype-mime-mismatch"))
         self.assertTrue(raised.exception.is_file_type_rejection)
 
+    def test_badmime_rejection_is_eligible_for_zip_fallback(self):
+        # A .js served as text/html (or a .zip detected as application/java):
+        # the detected MIME itself is disallowed, which a ZIP resolves.
+        failure = ({
+            "error": {
+                "code": "verification-error",
+                "info": 'Files of the MIME type "text/html" are not allowed to be uploaded.',
+                "details": ["filetype-badmime", "text/html"],
+            }
+        }, None)
+        client = RetryingClient([failure])
+        with self.assertRaises(WikiError) as raised:
+            asyncio.run(client.upload_file("project.js", b"<html></html>"))
+        self.assertTrue(raised.exception.has_detail("filetype-badmime"))
+        self.assertTrue(raised.exception.is_file_type_rejection)
+
+    def test_illegal_filename_rejection_is_eligible_for_zip_fallback(self):
+        # Seen on the chunked path for blocked extensions (.exe/.iso/.mkv); a ZIP
+        # renames the payload to an accepted filename.
+        failure = ({
+            "error": {"code": "illegal-filename", "info": "The filename is not allowed."}
+        }, None)
+        client = RetryingClient([failure])
+        with self.assertRaises(WikiError) as raised:
+            asyncio.run(client.upload_file("installer.exe", b"MZ..."))
+        self.assertEqual(raised.exception.code, "illegal-filename")
+        self.assertTrue(raised.exception.is_file_type_rejection)
+
+    def test_unrelated_error_is_not_treated_as_file_type_rejection(self):
+        error = WikiError("boom", error={"code": "badtoken", "info": "Invalid CSRF token."})
+        self.assertFalse(error.is_file_type_rejection)
+
 
 if __name__ == "__main__":
     unittest.main()
