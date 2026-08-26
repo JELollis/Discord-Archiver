@@ -1001,47 +1001,66 @@ async def populate(
         if lab_tech_role is None:
             logging.warning("Lab Tech role not found; channels will be created without Lab Tech access.")
 
-        created_channels = []
-        skipped_courses = []
-        for course_number in course_numbers:
+        # De-duplicate the requested course numbers up front (case-insensitively),
+        # so a repeated number in the input is never processed twice.
+        seen_numbers: set[str] = set()
+        unique_numbers = [
+            n for n in course_numbers
+            if not (n.casefold() in seen_numbers or seen_numbers.add(n.casefold()))
+        ]
+
+        created_channels = []      # newly created this run
+        existing_courses = []      # already present — skipped cleanly, no duplicate
+        skipped_courses = []       # no matching course role — nothing created
+        for course_number in unique_numbers:
             channel_name = f"{category_name}-{course_number}-{term.capitalize()}-{year}"
             existing_channel = next(
                 (c for c in guild.text_channels if c.name.casefold() == channel_name.casefold()),
                 None,
             )
-            if not existing_channel:
-                role_name = f"{category_name}-{course_number}"
-                role = discord.utils.get(guild.roles, name=role_name)
-                if not role:
-                    logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
-                    skipped_courses.append(course_number)
-                    continue
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                    role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-                }
-                if lab_tech_role is not None:
-                    overwrites[lab_tech_role] = discord.PermissionOverwrite(
-                        read_messages=True,
-                        send_messages=True,
-                        read_message_history=True
-                    )
-                new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
-                created_channels.append(new_channel.name)
-                logging.info("Channel '%s' created as private with role '%s' assigned.", new_channel.name, role_name)
+            if existing_channel:
+                existing_courses.append(course_number)
+                logging.info("Channel '%s' already exists (in '%s'); skipping.",
+                             existing_channel.name,
+                             existing_channel.category.name if existing_channel.category else "no category")
+                continue
+            role_name = f"{category_name}-{course_number}"
+            role = discord.utils.get(guild.roles, name=role_name)
+            if not role:
+                logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
+                skipped_courses.append(course_number)
+                continue
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            }
+            if lab_tech_role is not None:
+                overwrites[lab_tech_role] = discord.PermissionOverwrite(
+                    read_messages=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+            new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
+            created_channels.append(new_channel.name)
+            logging.info("Channel '%s' created as private with role '%s' assigned.", new_channel.name, role_name)
 
+        lines = [
+            f"**/populate {category_name} {term.capitalize()} {year}** — "
+            f"{len(created_channels)} created, {len(existing_courses)} already existed, "
+            f"{len(skipped_courses)} missing a role (of {len(unique_numbers)} requested)."
+        ]
         if created_channels:
-            message = f"Created private channels with roles: {', '.join(created_channels)}"
-            if lab_tech_role is None:
-                message += "\n⚠️ The `Lab Tech` role was not found, so these channels were created without Lab Tech access."
-            if skipped_courses:
-                message += f"\n⚠️ Skipped missing roles for courses: {', '.join(skipped_courses)}"
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            message = "No new channels were created. All channels already exist or roles were missing."
-            if skipped_courses:
-                message += f"\n⚠️ Skipped missing roles for courses: {', '.join(skipped_courses)}"
-            await interaction.followup.send(message, ephemeral=True)
+            lines.append(f"✅ Created: {', '.join(created_channels)}")
+        if existing_courses:
+            lines.append(f"↩️ Already existed (skipped): {', '.join(existing_courses)}")
+        if skipped_courses:
+            lines.append(
+                f"⚠️ No `{category_name}-<num>` role — not created (add reaction-roles first): "
+                + ", ".join(skipped_courses)
+            )
+        if created_channels and lab_tech_role is None:
+            lines.append("⚠️ The `Lab Tech` role was not found, so new channels have no Lab Tech access.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     except Exception as e:
         logging.error("An error occurred in populate: %s", str(e))

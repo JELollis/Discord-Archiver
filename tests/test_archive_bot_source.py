@@ -210,6 +210,23 @@ class ArchiveBotSourceTests(unittest.TestCase):
         self.assertIsNotNone(fast_path_line, "publish must call is_channel_archived")
         self.assertLess(fast_path_line, publish_channel_line)
 
+    def test_populate_reports_existing_channels_separately(self):
+        """/populate must skip existing channels cleanly and report them distinctly."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "populate")
+        names = {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+        # A dedicated bucket for already-present channels, separate from missing-role.
+        self.assertIn("existing_courses", names)
+        self.assertIn("skipped_courses", names)
+        # The existing-channel check is case-insensitive (no duplicate creation).
+        casefolds = sum(
+            1 for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "casefold"
+        )
+        self.assertGreaterEqual(casefolds, 2)
+
     def test_oversize_attachments_route_to_the_nas_sink(self):
         """archive_attachments must have a NAS route and a too-large fallback to it."""
         tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
