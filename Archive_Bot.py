@@ -1,8 +1,30 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
+import asyncio
 import datetime
 import os
 import logging
+import urllib.parse
+import re
+from pathlib import Path
+import tempfile
+
+from wiki_client import MediaWikiClient, WikiError, load_config
+import discord_export
+import empty_archive
+from attachment_archive import (
+    AttachmentTooLargeError,
+    create_zip_file,
+    file_sha1_and_size,
+    select_reusable_upload,
+    stage_discord_attachment,
+)
+from discord_rate_limit import (
+    AsyncActionPacer,
+    MIN_DISCORD_ACTION_INTERVAL_SECONDS,
+    build_discord_http_trace,
+)
 
 # Setup logging
 log_directory = "logs"
@@ -17,129 +39,2350 @@ logging.basicConfig(
 
 logging.info("Bot starting up.")
 
+with open("Bot Key.txt", "r", encoding="utf-8") as key_file:
+    TOKEN = key_file.readline().strip()
+
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    http_trace=build_discord_http_trace(),
+)
+tree = bot.tree
+
+_delete_discord_pacer = AsyncActionPacer(MIN_DISCORD_ACTION_INTERVAL_SECONDS)
+
+# ---- MediaWiki archive publishing (lazy client; created + logged in on first use) ----
+try:
+    WIKI_CONFIG = load_config()
+    WIKI_CONFIG_ERROR = None
+    logging.info("MediaWiki configuration loaded (namespace: %s).", WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"])
+except WikiError as exc:
+    WIKI_CONFIG = None
+    WIKI_CONFIG_ERROR = str(exc)
+    logging.warning("MediaWiki not configured; wiki commands disabled: %s", exc)
+
+_wiki_client: MediaWikiClient | None = None
+
+
+async def get_wiki_client() -> MediaWikiClient:
+    """Return a logged-in MediaWiki client, creating it on first use."""
+    global _wiki_client
+    if WIKI_CONFIG is None:
+        raise WikiError(WIKI_CONFIG_ERROR or "MediaWiki is not configured on this host.")
+    if _wiki_client is None:
+        client = MediaWikiClient.from_config(WIKI_CONFIG)
+        try:
+            await client.login()
+        except Exception:
+            await client.close()
+            raise
+        _wiki_client = client
+    return _wiki_client
+
+
+def wiki_page_url(title: str) -> str:
+    """Public index.php URL for a wiki page title."""
+    base = WIKI_CONFIG["MEDIAWIKI_API_URL"].rsplit("/api.php", 1)[0]
+    return f"{base}/index.php/" + urllib.parse.quote(title.replace(" ", "_"), safe="/:")
+
+
+def empty_channel_list_url(channel_id: int) -> str:
+    """Return the shared empty-channel registry URL anchored to one record."""
+    title = empty_archive.list_page_title(
+        WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+    )
+    return f"{wiki_page_url(title)}#{empty_archive.entry_anchor(channel_id)}"
+
+
+def _paginate_lines(lines: list[str], limit: int = 1900) -> list[str]:
+    """Join lines into Discord-safe chunks, splitting an oversized line too."""
+    chunks = []
+    current = ""
+    for original in lines:
+        line = str(original)
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if current and len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _message_dict(m, guild, stream_id: int) -> dict:
+    """Serialise one Discord message into the archive dict shape."""
+    return {
+        "id": m.id,
+        "stream_id": stream_id,
+        "author": getattr(m.author, "display_name", str(m.author)),
+        "author_username": getattr(m.author, "name", None),
+        "author_id": m.author.id,
+        "created": m.created_at,
+        "edited": m.edited_at,
+        "content": discord_export.resolve_mentions(
+            m.content, guild,
+            members={x.id: x for x in getattr(m, "mentions", [])},
+            channels={x.id: x for x in getattr(m, "channel_mentions", [])},
+            roles={x.id: x for x in getattr(m, "role_mentions", [])},
+        ),
+        "attachments": [
+            {"id": a.id, "filename": a.filename, "size": a.size,
+             "content_type": a.content_type, "_obj": a}
+            for a in m.attachments
+        ],
+        "reply_to": m.reference.message_id if m.reference else None,
+    }
+
+
+async def _iter_threads(channel):
+    """Yield a channel's active + archived (public and private) threads, de-duplicated.
+
+    Raises on any failure to enumerate archived threads (missing permission or a
+    transient Discord API error). Callers MUST treat that failure as "threads
+    could not be fully listed" — never as an empty result — so uncaptured thread
+    history can never be silently excluded from an archive or a deletion check.
+    """
+    seen = set()
+    for th in list(getattr(channel, "threads", [])):
+        if th.id not in seen:
+            seen.add(th.id)
+            yield th
+    for kwargs in ({}, {"private": True}):
+        async for th in channel.archived_threads(limit=None, **kwargs):
+            if th.id not in seen:
+                seen.add(th.id)
+                yield th
+
+
+def _archive_marker_re(channel_id: int) -> re.Pattern:
+    """Regex matching ONLY the complete bot-generated archive marker comment.
+
+    Anchored on the literal ``<!-- ... -->`` comment that ``render_page`` writes
+    for a finished capture. User-authored message text cannot forge it: angle
+    brackets in message content are HTML-escaped (``&lt;``) before publication,
+    so a message merely quoting ``source_channel_id=...`` never produces a real
+    comment and cannot pass this check. Group 1 is the capture timestamp and
+    group 2 is the legacy/global capture boundary.
+    """
+    return re.compile(
+        rf"<!-- source_channel_id={channel_id} captured_at=([^\n]*?) captured_until=(\d+) -->"
+    )
+
+
+def _is_locked_readonly(channel) -> bool:
+    """True if ordinary members cannot post through channel overwrites.
+
+    Matches the state `/archive` leaves: `@everyone` denied `send_messages` and no
+    permission overwrite granting `send_messages` to anyone but the bot. Requiring
+    this before publish/delete enforces the archive→publish→delete workflow. Admins
+    and webhooks may still bypass a lock, so per-stream boundaries and edit times
+    remain the authoritative deletion proof.
+    """
+    guild = channel.guild
+    default = channel.overwrites_for(guild.default_role)
+    if default.send_messages is not False or default.send_messages_in_threads is not False:
+        return False
+    for target, overwrite in channel.overwrites.items():
+        if guild.me is not None and target == guild.me:
+            continue
+        if overwrite.send_messages or overwrite.send_messages_in_threads:
+            return False
+    return True
+
+
+# Ownership is independent of completion: an incomplete page must not be
+# overwriteable by another Discord channel with the same name. The legacy
+# completion marker remains a fallback for pages published before this marker
+# was introduced.
+_OWNER_MARKER_RE = re.compile(r"<!-- archive_owner_channel_id=(\d+) -->")
+_LEGACY_OWNER_MARKER_RE = re.compile(
+    r"<!-- source_channel_id=(\d+) captured_at=[^\n]*? captured_until=\d+ -->"
+)
+_STREAM_MARKER_RE = re.compile(
+    r"<!-- source_stream_id=(\d+) captured_until=(\d+) -->"
+)
+
+
+def _format_capture_time(value: datetime.datetime) -> str:
+    """Format an exact UTC capture start for the generated marker."""
+    return value.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_capture_time(value: str) -> datetime.datetime:
+    """Parse current precise timestamps plus minute-precision legacy markers."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M UTC"):
+        try:
+            return datetime.datetime.strptime(value, fmt).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"unsupported capture timestamp: {value!r}")
+
+
+def _page_owner_id(content: str) -> int | None:
+    """Return the generated owner id, including legacy complete pages."""
+    marker = _OWNER_MARKER_RE.search(content) or _LEGACY_OWNER_MARKER_RE.search(content)
+    return int(marker.group(1)) if marker else None
+
+
+async def _require_owned_or_missing_page(
+    client: MediaWikiClient,
+    title: str,
+    channel_id: int,
+    channel_name: str,
+    *,
+    legacy_part_number: int | None = None,
+) -> dict | None:
+    """Require channel ownership, with a strict one-time legacy migration."""
+    page = await client.get_page(title)
+    if page is None:
+        return None
+    owner_id = _page_owner_id(page["content"])
+    if owner_id is None:
+        bot_username = client.username.split("@", 1)[0]
+        if discord_export.is_adoptable_legacy_incomplete_page(
+            page,
+            channel_name,
+            bot_username,
+            part_number=legacy_part_number,
+        ):
+            logging.warning(
+                "Adopting verified legacy incomplete archive page %r for channel %s",
+                title, channel_id,
+            )
+            return page
+        raise WikiError(
+            f"archive page {title!r} already exists without a bot ownership marker; refusing to overwrite it")
+    if owner_id != channel_id:
+        raise WikiError(f"archive page {title!r} belongs to another Discord channel")
+    return page
+
+
+async def _empty_record_for_channel(
+    client: MediaWikiClient, channel: discord.TextChannel
+) -> dict | None:
+    """Return this channel's shared empty record, rejecting an ID collision."""
+    namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+    records, _page = await empty_archive.load_records(client, namespace)
+    record = records.get(channel.id)
+    if record and record["guild_id"] != channel.guild.id:
+        raise WikiError(
+            f"empty-channel registry entry for {channel.id} belongs to another Discord guild"
+        )
+    return record
+
+
+async def _is_recorded_channel_still_empty(
+    client: MediaWikiClient, channel: discord.TextChannel
+) -> bool:
+    """Verify a shared-list record plus the channel's current empty state."""
+    try:
+        record = await _empty_record_for_channel(client, channel)
+        if record is None:
+            return False
+        if not _is_locked_readonly(channel):
+            return False
+        return await empty_archive.is_completely_empty(channel, _iter_threads)
+    except Exception as exc:
+        logging.warning(
+            "Could not verify empty-channel record for #%s; blocking deletion: %s",
+            channel.name, exc,
+        )
+        return False
+
+
+async def _archive_parts_match(
+    client: MediaWikiClient,
+    title: str,
+    channel_id: int,
+    manifest: list[tuple[int, str]],
+) -> bool:
+    """Verify every expected split part still exists, is owned, and hashes identically."""
+    for part_number, expected_digest in manifest:
+        page = await client.get_page(f"{title}/Part {part_number}")
+        if page is None or _page_owner_id(page["content"]) != channel_id:
+            return False
+        actual_digest = discord_export.content_sha256(page["content"])
+        if actual_digest != expected_digest:
+            return False
+    return True
+
+
+async def _archive_attachments_match(
+    client: MediaWikiClient,
+    manifest: list[tuple[str, str, int]],
+) -> bool:
+    """Verify every uploaded file still has the captured bytes."""
+    for filename, expected_digest, expected_size in manifest:
+        info = await client.get_file_info(filename)
+        if (info is None
+                or info["sha1"] != expected_digest
+                or info["size"] != expected_size):
+            return False
+    return True
+
+
+async def _archive_external_attachments_match(
+    manifest: list[tuple[str, str, int]],
+) -> bool:
+    """Verify every NAS-hosted attachment still exists at its recorded size.
+
+    NAS files have no MediaWiki imageinfo, so the deletion gate verifies them by
+    reading the share directly. Existence + byte size (a cheap stat) is used
+    rather than re-hashing, since these can be multi-gigabyte files on a trusted
+    private store; that still fails closed if a file is deleted or truncated.
+    """
+    for filename, _digest, expected_size in manifest:
+        try:
+            stat = await asyncio.to_thread(_nas_path(filename).stat)
+        except OSError:
+            return False
+        if stat.st_size != expected_size:
+            return False
+    return True
+
+
+async def capture_channel(channel: discord.TextChannel) -> tuple[list, bool]:
+    """Read a channel's full history AND all its threads (oldest first).
+
+    Returns ``(messages, complete)``. ``messages`` is a flat list; each thread is
+    introduced by a ``{"thread_header": name}`` marker entry followed by that
+    thread's messages, so splitting/rendering handle threads uniformly and no
+    thread content is lost before deletion. ``complete`` is ``False`` when thread
+    enumeration or a per-thread history read failed, so the caller can refuse to
+    mark the archive complete and thereby block deletion of uncaptured history.
+    """
+    guild = channel.guild
+    messages = []
+    complete = True
+    async for m in channel.history(limit=None, oldest_first=True):
+        messages.append(_message_dict(m, guild, channel.id))
+    try:
+        threads = [th async for th in _iter_threads(channel)]
+    except Exception as exc:
+        # Could not fully list threads (permission / transient API error). Do not
+        # treat this as "no threads": mark the capture incomplete so deletion of
+        # potentially uncaptured thread history is blocked.
+        logging.warning("Could not enumerate threads in #%s: %s", channel.name, exc)
+        return messages, False
+    for thread in threads:
+        thread_messages = []
+        try:
+            async for m in thread.history(limit=None, oldest_first=True):
+                thread_messages.append(_message_dict(m, guild, thread.id))
+        except Exception as exc:
+            logging.warning("Could not read thread '%s' in #%s: %s", getattr(thread, "name", "?"), channel.name, exc)
+            complete = False
+        messages.append({
+            "thread_header": thread.name, "id": thread.id,
+            "attachments": [], "content": "", "reply_to": None,
+        })
+        messages.extend(thread_messages)
+    return messages, complete
+
+
+async def _reuse_archived_attachment(
+    client: MediaWikiClient,
+    channel_name: str,
+    message_id: int,
+    att: dict,
+    existing_manifest: dict[str, tuple[str, int]],
+) -> bool:
+    """Reuse an already-uploaded, still-intact wiki attachment instead of re-uploading.
+
+    Matches this attachment's deterministic direct name and its ZIP-fallback name
+    against the sealed manifest of the existing owned page, and confirms MediaWiki
+    still holds those exact bytes (filename + SHA-1 + size) before reusing it. On
+    reuse the wiki_* fields are populated so the rebuilt page and manifest are
+    byte-identical to a fresh upload.
+    """
+    base_name = discord_export.attachment_upload_name(
+        channel_name, message_id, att["id"], att["filename"]
+    )
+    zip_name = discord_export.zip_fallback_upload_name(base_name)
+    selection = select_reusable_upload(base_name, zip_name, existing_manifest)
+    if selection is None:
+        return False
+    candidate, zipped, manifest_sha1, manifest_size = selection
+    try:
+        info = await client.get_file_info(candidate)
+    except Exception as exc:
+        logging.warning(
+            "Could not check existing wiki attachment %r for #%s: %s",
+            candidate, channel_name, exc,
+        )
+        return False
+    if info is None or info["sha1"] != manifest_sha1 or info["size"] != manifest_size:
+        return False
+    att["wiki_filename"] = candidate
+    att["wiki_sha1"] = manifest_sha1
+    att["wiki_size"] = manifest_size
+    if zipped:
+        att["zipped"] = True
+    return True
+
+
+# Attachments of these types always go to the NAS store rather than the wiki,
+# regardless of size (they are large and/or blocked by MediaWiki anyway).
+_NAS_EXTENSIONS = {"iso"}
+
+
+def _nas_public_url(nas_filename: str) -> str:
+    base = WIKI_CONFIG["ARCHIVE_NAS_URL_BASE"]
+    return f"{base}/" + urllib.parse.quote(nas_filename, safe="")
+
+
+def _nas_path(nas_filename: str) -> Path:
+    return Path(WIKI_CONFIG["ARCHIVE_NAS_DIR"]) / nas_filename
+
+
+def _annotate_nas_attachment(att: dict, nas_name: str, digest: str, size: int) -> None:
+    att["nas_filename"] = nas_name
+    att["nas_url"] = _nas_public_url(nas_name)
+    att["nas_sha1"] = digest
+    att["nas_size"] = size
+    att["external"] = True
+
+
+def _reuse_nas_attachment(
+    att: dict,
+    existing_external: dict[str, tuple[str, int]],
+) -> bool:
+    """Reuse a NAS-stored attachment already recorded on the page, by size.
+
+    Fast path for re-publish: trusts the recorded SHA-1 without re-hashing a
+    possibly multi-gigabyte file, provided the share still holds it at that size.
+    """
+    nas_name = discord_export.nas_filename(att["filename"])
+    entry = existing_external.get(nas_name)
+    if entry is None:
+        return False
+    manifest_sha1, manifest_size = entry
+    try:
+        stat = _nas_path(nas_name).stat()
+    except OSError:
+        return False
+    if stat.st_size != manifest_size:
+        return False
+    _annotate_nas_attachment(att, nas_name, manifest_sha1, manifest_size)
+    return True
+
+
+async def _archive_to_nas(
+    channel_name: str, message_id: int, att: dict, obj, nas_max: int, chunk_size: int,
+) -> bool:
+    """Store an oversize/NAS-designated attachment on the file share and link it.
+
+    The file keeps its original name. If the share already holds a file by that
+    name (the user's software repository often already has it), it is linked as-is
+    without re-downloading or overwriting. Otherwise it is streamed straight to the
+    share (never the small root disk). Either way the attachment is annotated with
+    its public URL + SHA-1/size so the page links it and the deletion gate can
+    verify it. Returns True when an existing file was reused, False when downloaded.
+    """
+    nas_name = discord_export.nas_filename(att["filename"])
+    final_path = _nas_path(nas_name)
+    try:
+        already_present = await asyncio.to_thread(final_path.is_file)
+    except OSError:
+        already_present = False
+    if already_present:
+        digest, size = await asyncio.to_thread(file_sha1_and_size, final_path)
+        logging.info(
+            "Linking existing NAS file for #%s msg %s: %r (%d bytes).",
+            channel_name, message_id, nas_name, size,
+        )
+        _annotate_nas_attachment(att, nas_name, digest, size)
+        return True
+    part_path = final_path.with_name(final_path.name + ".part")
+    expected_size = int(att.get("size", 0))
+    logging.info(
+        "Downloading oversize/NAS attachment #%s msg %s: %r (%d bytes) -> %s",
+        channel_name, message_id, att["filename"], expected_size, final_path,
+    )
+    try:
+        await stage_discord_attachment(
+            obj, part_path,
+            expected_size=expected_size,
+            maximum_size=nas_max,
+            memory_threshold=chunk_size,
+        )
+        digest, size = await asyncio.to_thread(file_sha1_and_size, part_path)
+        await asyncio.to_thread(os.replace, part_path, final_path)
+    except BaseException:
+        # Never leave a partial file that a later reuse might trust.
+        try:
+            await asyncio.to_thread(part_path.unlink, True)
+        except OSError:
+            pass
+        raise
+    _annotate_nas_attachment(att, nas_name, digest, size)
+    return False
+
+
+async def archive_attachments(
+    client: MediaWikiClient,
+    channel_name: str,
+    messages: list,
+    *,
+    existing_manifest: dict[str, tuple[str, int]] | None = None,
+    existing_external: dict[str, tuple[str, int]] | None = None,
+) -> dict:
+    """Upload each attachment to the wiki; annotate dicts with wiki_filename/error.
+
+    Files whose type the wiki bans (e.g. .exe/.msi installers), or whose valid
+    extension MediaWiki cannot reconcile with its detected MIME type, are
+    re-uploaded inside a ZIP. This preserves the content without weakening
+    MediaWiki's upload verification.
+
+    When ``existing_manifest`` (the sealed attachment manifest of the owning
+    page, mapping wiki filename -> (sha1, size)) is supplied, an attachment whose
+    archived copy is still intact is reused rather than downloaded and uploaded
+    again, so re-running ``/publish`` on an incomplete archive only transfers the
+    missing or mismatched files. Returns ``{"archived", "uploaded", "reused"}``.
+    """
+    uploaded = 0
+    reused = 0
+    nas_uploaded = 0
+    nas_reused = 0
+    nas_enabled = bool(WIKI_CONFIG.get("ARCHIVE_NAS_ENABLED"))
+    nas_max = int(WIKI_CONFIG.get("ARCHIVE_NAS_MAX_BYTES", 0))
+    wiki_maximum = await client.max_upload_size()
+    configured_maximum = WIKI_CONFIG["MEDIAWIKI_MAX_ATTACHMENT_BYTES"]
+    maximum_size = min(wiki_maximum, configured_maximum)
+    chunk_size = min(WIKI_CONFIG["MEDIAWIKI_UPLOAD_CHUNK_BYTES"], maximum_size)
+    logging.info(
+        "Attachment archive limits for #%s: wiki=%d bytes, bot=%d bytes, effective=%d bytes, chunk=%d bytes.",
+        channel_name,
+        wiki_maximum,
+        configured_maximum,
+        maximum_size,
+        chunk_size,
+    )
+    for m in messages:
+        for att in m["attachments"]:
+            obj = att.pop("_obj", None)
+            if existing_manifest and await _reuse_archived_attachment(
+                client, channel_name, m["id"], att, existing_manifest
+            ):
+                reused += 1
+                logging.info(
+                    "Reusing verified wiki attachment for #%s msg %s: %r.",
+                    channel_name, m["id"], att["wiki_filename"],
+                )
+                continue
+            if nas_enabled and existing_external and _reuse_nas_attachment(
+                att, existing_external
+            ):
+                nas_reused += 1
+                logging.info(
+                    "Reusing NAS attachment for #%s msg %s: %r.",
+                    channel_name, m["id"], att["nas_filename"],
+                )
+                continue
+            if obj is None:
+                att["error"] = "attachment unavailable"
+                continue
+            extension = att["filename"].rsplit(".", 1)[-1].lower() if "." in att["filename"] else ""
+            route_to_nas = nas_enabled and (
+                int(att.get("size", 0)) > maximum_size or extension in _NAS_EXTENSIONS
+            )
+            try:
+                if route_to_nas:
+                    if await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size):
+                        nas_reused += 1
+                    else:
+                        nas_uploaded += 1
+                    continue
+                expected_size = int(att.get("size", 0))
+                logging.info(
+                    "Staging Discord attachment #%s msg %s: %r (%d bytes).",
+                    channel_name,
+                    m["id"],
+                    att["filename"],
+                    expected_size,
+                )
+                name = discord_export.attachment_upload_name(channel_name, m["id"], att["id"], att["filename"])
+                with tempfile.TemporaryDirectory(prefix="discord-archive-") as temp_dir:
+                    source_path = Path(temp_dir) / "attachment.bin"
+                    await stage_discord_attachment(
+                        obj,
+                        source_path,
+                        expected_size=expected_size,
+                        maximum_size=maximum_size,
+                        memory_threshold=chunk_size,
+                    )
+                    uploaded_path = source_path
+                    try:
+                        result = await client.upload_file_from_path(
+                            name,
+                            source_path,
+                            comment=f"Discord attachment from #{channel_name}",
+                            chunk_size=chunk_size,
+                        )
+                        att["wiki_filename"] = result.get("filename") or name
+                    except WikiError as exc:
+                        if not exc.is_file_type_rejection:
+                            raise
+                        # Preserve blocked/mismatched types in a ZIP. The outer
+                        # upload name has no compound extension, while the entry
+                        # inside the ZIP retains its original Discord filename.
+                        zip_name = discord_export.zip_fallback_upload_name(name)
+                        zip_path = Path(temp_dir) / "attachment.zip"
+                        await asyncio.to_thread(
+                            create_zip_file,
+                            source_path,
+                            zip_path,
+                            att["filename"],
+                        )
+                        _, zip_size = await asyncio.to_thread(file_sha1_and_size, zip_path)
+                        if zip_size > maximum_size:
+                            raise AttachmentTooLargeError(
+                                f"zipped attachment is {zip_size} bytes; archive limit is {maximum_size} bytes"
+                            )
+                        uploaded_path = zip_path
+                        result = await client.upload_file_from_path(
+                            zip_name,
+                            zip_path,
+                            comment=f"Discord attachment (zipped) from #{channel_name}",
+                            chunk_size=chunk_size,
+                        )
+                        att["wiki_filename"] = result.get("filename") or zip_name
+                        att["zipped"] = True
+                    digest, uploaded_size = await asyncio.to_thread(
+                        file_sha1_and_size, uploaded_path
+                    )
+                    att["wiki_sha1"] = digest
+                    att["wiki_size"] = uploaded_size
+                uploaded += 1
+            except AttachmentTooLargeError as exc:
+                # The real bytes exceeded the wiki cap. Fall back to the NAS store
+                # (re-downloading straight to the share) when it is available.
+                if nas_enabled and not route_to_nas:
+                    try:
+                        if await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size):
+                            nas_reused += 1
+                        else:
+                            nas_uploaded += 1
+                        continue
+                    except Exception as nas_exc:
+                        att["error"] = f"too large for the wiki and the NAS store failed: {nas_exc}"
+                        logging.warning("NAS fallback failed (#%s msg %s): %s", channel_name, m["id"], nas_exc)
+                        continue
+                att["error"] = str(exc)
+                logging.warning("Attachment too large (#%s msg %s): %s", channel_name, m["id"], exc)
+            except Exception as exc:
+                att["error"] = str(exc)
+                logging.warning("Attachment upload failed (#%s msg %s): %s", channel_name, m["id"], exc)
+    return {
+        "archived": uploaded + reused + nas_uploaded + nas_reused,
+        "uploaded": uploaded,
+        "reused": reused,
+        "nas_uploaded": nas_uploaded,
+        "nas_reused": nas_reused,
+    }
+
+
+async def is_channel_archived(client: MediaWikiClient | None, channel) -> bool:
+    """True if a current archive page or verified-empty record exists.
+
+    Voice/stage channels are exempt only after their persistent text chat is
+    verified empty. Forum and other unsupported message-bearing channels are
+    never considered archived by the v1 exporter.
+    """
+    if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        try:
+            history = getattr(channel, "history", None)
+            if history is None:
+                return False
+            async for _message in channel.history(limit=1):
+                return False
+            return True
+        except Exception as exc:
+            logging.warning(
+                "Could not verify voice/stage text chat for %s; blocking deletion: %s",
+                channel.name, exc,
+            )
+            return False
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    if client is None:
+        return False
+    title = discord_export.make_page_title(channel.name, WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"])
+    page = await client.get_page(title)
+    if not page:
+        return await _is_recorded_channel_still_empty(client, channel)
+    if not discord_export.verify_canonical_content(page["content"]):
+        logging.warning("Canonical archive content changed for #%s; blocking deletion.", channel.name)
+        return False
+    marker = _archive_marker_re(channel.id).search(page["content"])
+    if not marker:
+        return False
+    try:
+        capture_dt = _parse_capture_time(marker.group(1))
+    except ValueError:
+        logging.warning("Unparseable captured_at for #%s; blocking deletion.", channel.name)
+        return False
+    stream_pairs = _STREAM_MARKER_RE.findall(page["content"])
+    stream_boundaries = {int(stream_id): int(boundary) for stream_id, boundary in stream_pairs}
+    # Duplicate/conflicting markers or a missing parent boundary make the proof
+    # ambiguous. Older archives without per-stream markers must be republished.
+    if len(stream_pairs) != len(stream_boundaries) or channel.id not in stream_boundaries:
+        logging.warning("Missing or ambiguous stream boundaries for #%s; blocking deletion.", channel.name)
+        return False
+    part_manifest = discord_export.parse_part_manifest(page["content"])
+    if part_manifest is None:
+        logging.warning("Missing or ambiguous part manifest for #%s; blocking deletion.", channel.name)
+        return False
+    try:
+        if not await _archive_parts_match(client, title, channel.id, part_manifest):
+            logging.warning("Split archive parts changed or are missing for #%s; blocking deletion.", channel.name)
+            return False
+    except Exception as exc:
+        logging.warning("Could not verify split archive parts for #%s: %s", channel.name, exc)
+        return False
+    attachment_manifest = discord_export.parse_attachment_manifest(page["content"])
+    if attachment_manifest is None:
+        logging.warning("Missing or ambiguous attachment manifest for #%s; blocking deletion.", channel.name)
+        return False
+    try:
+        if not await _archive_attachments_match(client, attachment_manifest):
+            logging.warning("Archived attachments changed or are missing for #%s; blocking deletion.", channel.name)
+            return False
+    except Exception as exc:
+        logging.warning("Could not verify archived attachments for #%s: %s", channel.name, exc)
+        return False
+    # The external (NAS) manifest is newer than some archives. Its bytes are
+    # already covered by the verified canonical seal above, so an absent marker is
+    # a legacy page with no NAS files; only a present-but-malformed one blocks.
+    if "archive_external_count=" in page["content"]:
+        external_manifest = discord_export.parse_external_manifest(page["content"])
+        if external_manifest is None:
+            logging.warning("Ambiguous external (NAS) manifest for #%s; blocking deletion.", channel.name)
+            return False
+    else:
+        external_manifest = []
+    try:
+        if not await _archive_external_attachments_match(external_manifest):
+            logging.warning("NAS-hosted attachments changed or are missing for #%s; blocking deletion.", channel.name)
+            return False
+    except Exception as exc:
+        logging.warning("Could not verify NAS-hosted attachments for #%s: %s", channel.name, exc)
+        return False
+    thread_manifest = discord_export.parse_thread_manifest(page["content"])
+    expected_thread_ids = set(stream_boundaries) - {channel.id}
+    if thread_manifest is None or set(thread_manifest) != expected_thread_ids:
+        logging.warning("Missing or ambiguous thread manifest for #%s; blocking deletion.", channel.name)
+        return False
+    # Keep enforcing the operator workflow at deletion time as an additional
+    # safety layer; per-stream boundaries below cover admin/webhook bypasses.
+    if not _is_locked_readonly(channel):
+        return False
+
+    def _stream_current(stream_id: int, messages_iter):
+        # Each stream has its own boundary, so a later thread snowflake cannot hide
+        # a parent-channel post omitted during sequential capture. Every message
+        # must also be unedited since capture began (locked messages remain editable
+        # by their authors, and admins/webhooks can bypass a channel lock).
+        async def check():
+            boundary = stream_boundaries.get(stream_id)
+            if boundary is None:
+                return False
+            async for message in messages_iter:
+                if message.id > boundary:
+                    return False
+                edited = getattr(message, "edited_at", None)
+                if edited is not None and edited > capture_dt:
+                    return False
+            return True
+        return check()
+
+    try:
+        if not await _stream_current(
+            channel.id,
+            channel.history(limit=None, oldest_first=False),
+        ):
+            return False
+        # Every thread (active + archived) must also be captured and unedited; a
+        # failure to list or read threads blocks deletion (contents unprovable).
+        threads = [thread async for thread in _iter_threads(channel)]
+        current_threads = {
+            thread.id: discord_export.content_sha256(thread.name)
+            for thread in threads
+        }
+        if current_threads != thread_manifest:
+            logging.warning("Thread set or names changed for #%s; blocking deletion.", channel.name)
+            return False
+        for thread in threads:
+            if not await _stream_current(
+                thread.id,
+                thread.history(limit=None, oldest_first=False),
+            ):
+                return False
+    except Exception as exc:
+        logging.warning("Content verification failed for #%s; blocking deletion: %s", channel.name, exc)
+        return False
+    return True
 
 @bot.event
 async def on_ready():
     logging.info(f'Logged in as {bot.user}!')
     print(f'Logged in as {bot.user}!')
-
-# Define a decorator function to check if the user has a specific role
-def is_admin_or_has_role(role_name):
-    async def predicate(ctx):
-        if ctx.author.guild_permissions.administrator:
-            return True
-        role = discord.utils.get(ctx.guild.roles, name=role_name)
-        if role and role in ctx.author.roles:
-            return True
-        return False
-    return commands.check(predicate)
-
-@bot.command()
-@is_admin_or_has_role("Admin")  # Replace "Admin" with the role name you want to check
-async def archive(ctx, term: str = None):
     try:
-        logging.debug("Command invoked with term: %s", term)
-        if term is None or term.lower() not in ["spring", "summer", "fall"]:
-            await ctx.send("Invalid term. Please specify a valid term: `Spring`, `Summer`, or `Fall`.")
-            logging.debug("Invalid term provided or term is None.")
+        # Sync commands globally
+        await tree.sync()
+        logging.info("Slash commands synchronized globally.")
+    except Exception as e:
+        logging.error("Error syncing commands: %s", str(e))
+        print(f"Error syncing commands: {str(e)}")
+
+# Define slash command to archive
+@tree.command(name="archive", description="Archive channels and categories based on a term and year.")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+@app_commands.describe(term="The term to archive (e.g., Spring, Summer, Fall)", year="The year (e.g., 2025)")
+async def archive(interaction: discord.Interaction, term: str, year: int):
+    responded = False
+    try:
+        # Defer the interaction to allow processing time
+        await interaction.response.defer(ephemeral=True)
+        responded = True
+        logging.debug("Archive command invoked with term: %s, year: %d", term, year)
+
+        # Validate inputs
+        if term.lower() not in ["spring", "summer", "fall"]:
+            await interaction.followup.send("Invalid term. Please specify: `Spring`, `Summer`, or `Fall`.", ephemeral=True)
+            return
+        if not (1900 <= year <= 2100):
+            await interaction.followup.send("Invalid year. Please provide a valid year (e.g., 2025).", ephemeral=True)
             return
 
         term = term.lower()
-        current_year = datetime.datetime.now().year
-        logging.debug("Current year: %d, Term: %s", current_year, term)
+        archive_category_name = f"{term.capitalize()} {year} Archive"
+        guild = interaction.guild
+        if guild is None or not interaction.user.guild_permissions.manage_channels:
+            await interaction.followup.send("You need the Manage Channels permission to use `/archive`.", ephemeral=True)
+            return
 
-        archive_category_name = f"{term.capitalize()} {current_year} Archive"
-        logging.debug("Archive category name: %s", archive_category_name)
+        # Fetch the Verified role
+        verified_role = discord.utils.get(guild.roles, name="Verified")
 
-        # Create the archive category if it doesn't exist
-        archive_category = discord.utils.get(ctx.guild.categories, name=archive_category_name)
+        if not verified_role:
+            await interaction.followup.send("The 'Verified' role does not exist. Please create it first.", ephemeral=True)
+            logging.error("Verified role not found.")
+            return
+
+        archive_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                read_messages=False, send_messages=False,
+                send_messages_in_threads=False,
+            ),
+            verified_role: discord.PermissionOverwrite(
+                read_messages=True, send_messages=False,
+                send_messages_in_threads=False, read_message_history=True,
+            ),
+        }
+        if guild.me is not None:
+            archive_overwrites[guild.me] = discord.PermissionOverwrite(
+                read_messages=True, read_message_history=True,
+                send_messages=False, send_messages_in_threads=False,
+            )
+
+        # Create the category with its complete permission map in one request.
+        archive_category = discord.utils.get(guild.categories, name=archive_category_name)
         if not archive_category:
-            archive_category = await ctx.guild.create_category(archive_category_name)
-            await archive_category.set_permissions(ctx.guild.default_role, read_messages=True, send_messages=False)
-            await ctx.send(f'Archive category {archive_category_name} created and permissions set.')
-            logging.info("Archive category %s created.", archive_category_name)
-        else:
-            await ctx.send(f'Archive category {archive_category_name} already exists.')
-            logging.info("Archive category %s already exists.", archive_category_name)
+            archive_category = await guild.create_category(
+                archive_category_name, overwrites=archive_overwrites,
+                reason=f"Archive category requested by {interaction.user} ({interaction.user.id})",
+            )
+            logging.info("Archive category '%s' created.", archive_category_name)
 
-        # Move existing channels to archive and set read-only permissions
+        # Find and move matching channels
         moved_channels = []
-        for channel in ctx.guild.text_channels:
-            if f"-{term}-{current_year}" in channel.name.lower():
-                await channel.edit(category=archive_category)
-                await channel.set_permissions(ctx.guild.default_role, read_messages=True, send_messages=False)
+        for channel in guild.text_channels:
+            logging.debug("Checking channel: %s", channel.name)
+            if f"-{term}-{year}" in channel.name.lower():
+                # Moving and replacing the full overwrite map in one PATCH avoids
+                # a transient exposure (or a half-cleared state after an API error).
+                await channel.edit(
+                    category=archive_category,
+                    overwrites=archive_overwrites,
+                    reason=f"Channel archived by {interaction.user} ({interaction.user.id})",
+                )
                 moved_channels.append(channel.name)
-                await ctx.send(f'Moved channel: {channel.name}')
-                logging.debug("Moved channel: %s", channel.name)
+                logging.info("Channel '%s' moved to archive and permissions updated.", channel.name)
 
-        if not moved_channels:
-            await ctx.send('No channels were moved.')
-            logging.debug("No channels matched the criteria to move.")
+        if moved_channels:
+            await interaction.followup.send(f"Archived channels: {', '.join(moved_channels)}.", ephemeral=True)
+        else:
+            await interaction.followup.send("No channels found matching the specified term and year.", ephemeral=True)
+        logging.info("Archive process completed for %s %d.", term, year)
 
-        # Create new channels in the respective categories
-        created_channels = []
-        categories = ['CPT', 'IST', 'SPC', 'HSS', 'SOC']
-        for category_name in categories:
-            category = discord.utils.get(ctx.guild.categories, name=category_name)
-            if category:
-                logging.debug("Processing category: %s", category_name)
-                for channel_name in moved_channels:
-                    if channel_name.lower().startswith(category_name.lower()):
-                        new_channel_name = channel_name.replace(term, get_next_term(term))
-                        if term == "fall":
-                            new_channel_name = new_channel_name.replace(str(current_year), str(current_year + 1))
-
-                        logging.debug("New channel name: %s", new_channel_name)
-
-                        # Check if the channel already exists
-                        existing_channel = discord.utils.get(category.channels, name=new_channel_name)
-                        if existing_channel:
-                            await ctx.send(f'Channel {new_channel_name} already exists in {category_name}.')
-                            logging.debug("Channel %s already exists in %s.", new_channel_name, category_name)
-                            continue
-
-                        # Create the channel
-                        new_channel = await category.create_text_channel(new_channel_name)
-
-                        # Set channel permissions
-                        role_name = '-'.join(new_channel_name.split('-')[:-2])
-                        role = discord.utils.get(ctx.guild.roles, name=role_name)
-                        if role:
-                            overwrites = {
-                                ctx.guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
-                                role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-                            }
-                            await new_channel.edit(overwrites=overwrites)
-                            logging.debug("Permissions set for role: %s", role_name)
-                        else:
-                            await ctx.send(f"Role '{role_name}' not found. Permissions for {new_channel_name} were not fully applied.")
-                            logging.debug("Role '%s' not found for %s.", role_name, new_channel_name)
-
-                        await ctx.send(f'Created and set permissions for channel: {new_channel_name}')
-                        created_channels.append(new_channel_name)
-                        logging.info("Created new channel: %s", new_channel_name)
-
-        if not created_channels:
-            await ctx.send('No new channels were created.')
-            logging.debug("No new channels were created.")
-
-        await ctx.send(f'Archive process completed for {term.capitalize()} {current_year}.')
-        logging.info("Archive process completed for %s %d.", term.capitalize(), current_year)
     except Exception as e:
-        await ctx.send(f'An error occurred: {str(e)}')
-        logging.error("An error occurred: %s", str(e))
+        logging.error("An error occurred in archive: %s", str(e))
+        try:
+            if not responded:
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            logging.warning("Interaction already responded when handling archive error.")
 
-def get_next_term(current_term):
-    terms = ["spring", "summer", "fall"]
+# Define slash command to populate
+@tree.command(name="populate", description="Create categories and channels dynamically.")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+@app_commands.describe(
+    category="Select or create a category",
+    term="Specify the term (Spring, Summer, Fall)",
+    year="Specify the year (e.g., 2025)",
+    courses="Comma-separated list of course numbers"
+)
+@app_commands.choices(category=[
+    app_commands.Choice(name="CPT", value="CPT"),
+    app_commands.Choice(name="CYB", value="CYB"),
+    app_commands.Choice(name="IST", value="IST"),
+    app_commands.Choice(name="SPC", value="SPC"),
+    app_commands.Choice(name="SOC", value="SOC"),
+    app_commands.Choice(name="HSS", value="HSS"),
+    app_commands.Choice(name="HIS", value="HIS")
+])
+async def populate(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+    term: str,
+    year: int,
+    courses: str
+):
+    responded = False
     try:
-        index = terms.index(current_term)
-        return terms[(index + 1) % len(terms)]
-    except ValueError:
-        logging.debug("Invalid term provided to get_next_term: %s", current_term)
-        return "spring"  # Default to spring if term is invalid
+        # Defer the interaction to allow processing time
+        await interaction.response.defer(ephemeral=True)
+        responded = True
+        logging.debug("Populate command invoked with category: %s, term: %s, year: %d, courses: %s",
+                      category.value, term, year, courses)
 
-# Replace 'YOUR_BOT_TOKEN' with your actual bot token
-bot.run('')
+        # Validate the term
+        if term.lower() not in ["spring", "summer", "fall"]:
+            await interaction.followup.send("Invalid term. Please specify: `Spring`, `Summer`, or `Fall`.", ephemeral=True)
+            return
+
+        if not (1900 <= year <= 2100):
+            await interaction.followup.send("Invalid year. Please provide a valid year (e.g., 2025).", ephemeral=True)
+            return
+
+        course_numbers = [course.strip() for course in courses.split(",") if course.strip().isdigit()]
+        if not course_numbers:
+            await interaction.followup.send("No valid course numbers provided. Please provide a comma-separated list of numbers.", ephemeral=True)
+            return
+
+        # Create the category if it does not exist
+        guild = interaction.guild
+        if guild is None or not interaction.user.guild_permissions.manage_channels:
+            await interaction.followup.send("You need the Manage Channels permission to use `/populate`.", ephemeral=True)
+            return
+        category_name = category.value
+        existing_category = discord.utils.get(guild.categories, name=category_name)
+        if not existing_category:
+            existing_category = await guild.create_category(category_name)
+            logging.info("Category '%s' created.", category_name)
+
+        # Create channels under the category as private and assign roles
+        lab_tech_role = discord.utils.get(guild.roles, name="Lab Tech")
+        if lab_tech_role is None:
+            logging.warning("Lab Tech role not found; channels will be created without Lab Tech access.")
+
+        # De-duplicate the requested course numbers up front (case-insensitively),
+        # so a repeated number in the input is never processed twice.
+        seen_numbers: set[str] = set()
+        unique_numbers = [
+            n for n in course_numbers
+            if not (n.casefold() in seen_numbers or seen_numbers.add(n.casefold()))
+        ]
+
+        created_channels = []      # newly created this run
+        existing_courses = []      # already present — skipped cleanly, no duplicate
+        skipped_courses = []       # no matching course role — nothing created
+        for course_number in unique_numbers:
+            channel_name = f"{category_name}-{course_number}-{term.capitalize()}-{year}"
+            existing_channel = next(
+                (c for c in guild.text_channels if c.name.casefold() == channel_name.casefold()),
+                None,
+            )
+            if existing_channel:
+                existing_courses.append(course_number)
+                logging.info("Channel '%s' already exists (in '%s'); skipping.",
+                             existing_channel.name,
+                             existing_channel.category.name if existing_channel.category else "no category")
+                continue
+            role_name = f"{category_name}-{course_number}"
+            role = discord.utils.get(guild.roles, name=role_name)
+            if not role:
+                logging.warning("Role '%s' not found for channel '%s'.", role_name, channel_name)
+                skipped_courses.append(course_number)
+                continue
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            }
+            if lab_tech_role is not None:
+                overwrites[lab_tech_role] = discord.PermissionOverwrite(
+                    read_messages=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+            new_channel = await guild.create_text_channel(name=channel_name, category=existing_category, overwrites=overwrites)
+            created_channels.append(new_channel.name)
+            logging.info("Channel '%s' created as private with role '%s' assigned.", new_channel.name, role_name)
+
+        lines = [
+            f"**/populate {category_name} {term.capitalize()} {year}** — "
+            f"{len(created_channels)} created, {len(existing_courses)} already existed, "
+            f"{len(skipped_courses)} missing a role (of {len(unique_numbers)} requested)."
+        ]
+        if created_channels:
+            lines.append(f"✅ Created: {', '.join(created_channels)}")
+        if existing_courses:
+            lines.append(f"↩️ Already existed (skipped): {', '.join(existing_courses)}")
+        if skipped_courses:
+            lines.append(
+                f"⚠️ No `{category_name}-<num>` role — not created (add reaction-roles first): "
+                + ", ".join(skipped_courses)
+            )
+        if created_channels and lab_tech_role is None:
+            lines.append("⚠️ The `Lab Tech` role was not found, so new channels have no Lab Tech access.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    except Exception as e:
+        logging.error("An error occurred in populate: %s", str(e))
+        try:
+            if not responded:
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            logging.warning("Interaction already responded when handling populate error.")
+
+# ---- Shared permissions helper for course roles ----
+def build_course_permissions() -> discord.Permissions:
+    perms = discord.Permissions.none()
+
+    # Text / Threads / Forum “Posts”
+    perms.view_channel = True
+    perms.change_nickname = True
+    perms.send_messages = True
+    perms.send_messages_in_threads = True
+    perms.create_public_threads = True
+    if hasattr(discord.Permissions, "create_forum_threads"):
+        perms.create_forum_threads = True  # forum posts
+
+    perms.embed_links = True
+    perms.attach_files = True
+    perms.add_reactions = True
+    perms.read_message_history = True
+    perms.use_application_commands = True
+
+    # Emoji/Stickers
+    perms.use_external_emojis = True
+    if hasattr(discord.Permissions, "use_external_stickers"):
+        perms.use_external_stickers = True
+
+    # Voice/Activities
+    perms.connect = True
+    perms.speak = True
+    perms.stream = True  # “Video”/Go Live
+    if hasattr(discord.Permissions, "use_embedded_activities"):
+        perms.use_embedded_activities = True
+
+    return perms
+
+
+# ---- /add_role command (creates missing; updates permissions on existing) ----
+@tree.command(name="add_role", description="Create or update course roles for a category (e.g., CYB 110, 201, 269)")
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.guild_only()
+@app_commands.describe(
+    category="Course category (CPT, CYB, IST, SPC, SOC, HSS, HIS)",
+    courses="Comma-separated list of course numbers (e.g., 110, 201, 269)"
+)
+@app_commands.choices(category=[
+    app_commands.Choice(name="CPT", value="CPT"),
+    app_commands.Choice(name="CYB", value="CYB"),
+    app_commands.Choice(name="IST", value="IST"),
+    app_commands.Choice(name="SPC", value="SPC"),
+    app_commands.Choice(name="SOC", value="SOC"),
+    app_commands.Choice(name="HSS", value="HSS"),
+    app_commands.Choice(name="HIS", value="HIS"),
+])
+async def add_role(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+    courses: str
+):
+    responded = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        responded = True
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.followup.send("You need the Manage Roles permission to use `/add_role`.", ephemeral=True)
+            return
+
+        # Parse numbers
+        course_numbers = [c.strip() for c in courses.split(",") if c.strip().isdigit()]
+        if not course_numbers:
+            await interaction.followup.send("No valid course numbers provided. Use a comma-separated list of numbers.", ephemeral=True)
+            return
+
+        perms = build_course_permissions()
+        created, updated, unchanged = [], [], []
+
+        for num in course_numbers:
+            role_name = f"{category.value}-{num}"
+            role = discord.utils.get(guild.roles, name=role_name)
+
+            # Create if missing
+            if role is None:
+                try:
+                    role = await guild.create_role(
+                        name=role_name,
+                        permissions=perms,
+                        reason=f"Auto-created by /add_role for {category.value} {num}"
+                    )
+                    created.append(role_name)
+                    continue
+                except discord.Forbidden:
+                    await interaction.followup.send(
+                        f"❌ Missing permissions to create role `{role_name}` (need Manage Roles, and my top role must be above it).",
+                        ephemeral=True
+                    )
+                    return
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Error creating `{role_name}`: {e}", ephemeral=True)
+                    return
+
+            # Update perms if different
+            try:
+                if role.permissions != perms:
+                    await role.edit(permissions=perms, reason=f"Sync perms via /add_role for {category.value} {num}")
+                    updated.append(role_name)
+                else:
+                    unchanged.append(role_name)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"❌ I can't edit `{role_name}`. Ensure I have Manage Roles and my top role is above `{role_name}`.",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                await interaction.followup.send(f"❌ Error updating `{role_name}`: {e}", ephemeral=True)
+                return
+
+        # Summary
+        lines = []
+        if created:   lines.append(f"✅ Created: {', '.join(created)}")
+        if updated:   lines.append(f"🔁 Updated perms: {', '.join(updated)}")
+        if unchanged: lines.append(f"✔️ Already correct: {', '.join(unchanged)}")
+        if not lines: lines.append("No changes made.")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    except Exception as e:
+        logging.error("An error occurred in add_role: %s", str(e))
+        try:
+            if not responded:
+                await interaction.response.send_message(f"An error occurred: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            logging.warning("Interaction already responded when handling add_role error.")
+
+
+# ---- /delete confirmation UI ----
+class DeleteConfirmationView(discord.ui.View):
+    """Confirmation controls and deletion state for a single `/delete` request.
+
+    Only the member who invoked the command may use the controls. Channels are
+    deleted before categories so category deletion never leaves selected child
+    channels behind. Individual failures are collected and reported instead of
+    stopping the remainder of the deletion operation.
+    """
+
+    def __init__(self, requester_id: int, channels, categories):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+        self.channels = channels
+        self.categories = categories
+        self.processing = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Prevent anyone except the original requester from confirming/cancelling."""
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the user who ran `/delete` can confirm this deletion.", ephemeral=True)
+            return False
+        if not interaction.user.guild_permissions.manage_channels:
+            await interaction.response.send_message(
+                "Your Manage Channels permission is no longer active; deletion cancelled.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Perform the confirmed deletion and report successes/failures."""
+        # Claim the operation before the first await. Component callbacks can be
+        # dispatched again while a slow archive re-verification is running, and
+        # merely disabling the in-memory button does not update Discord's copy.
+        already_processing = self.processing
+        self.processing = True
+        if already_processing:
+            await interaction.response.send_message(
+                "Deletion is already in progress. Please wait for the result.",
+                ephemeral=True,
+            )
+            return
+
+        # Acknowledge immediately because a large category can take several seconds.
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            self.processing = False
+            raise
+
+        # Disable the controls so the same deletion cannot be submitted twice.
+        for child in self.children:
+            child.disabled = True
+        button.label = "Deletion in progress…"
+        logging.info(
+            "Delete confirmation accepted from %s (%s): verifying %d channel(s) and %d category(s).",
+            interaction.user,
+            interaction.user.id,
+            len(self.channels),
+            len(self.categories),
+        )
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    "⏳ **Deletion in progress**\n"
+                    f"Re-verifying {len(self.channels)} channel(s), then deleting channels and categories. "
+                    "Large archived categories can take several minutes."
+                ),
+                view=self,
+            )
+        except Exception:
+            # The deletion remains safe and the deferred interaction can still be
+            # completed even if Discord rejects this best-effort progress update.
+            logging.exception("Could not update the /delete confirmation with progress status.")
+
+        deleted_channels = []
+        deleted_channel_ids = set()
+        deleted_categories = []
+        failures = []
+
+        # Re-verify wiki archives at confirm time. The pre-prompt check ran up to
+        # 60s ago; a member could have posted a new parent message or thread reply
+        # since, making the archive stale. Re-check each message-bearing channel
+        # immediately before deleting it so no uncaptured content is lost.
+        wiki_targets = [
+            c for c in self.channels
+            if isinstance(c, (discord.TextChannel, discord.ForumChannel))
+        ]
+        verify_client = None
+        if wiki_targets:
+            try:
+                verify_client = await get_wiki_client()
+            except Exception as exc:
+                for child in self.children:
+                    child.disabled = True
+                await interaction.edit_original_response(
+                    content=f"🛑 Cannot re-verify wiki archives ({exc}). Deletion aborted for safety; nothing was deleted.",
+                    view=self,
+                )
+                self.stop()
+                return
+
+        # Delete child/standalone channels first, then their categories.
+        for channel in self.channels:
+            if verify_client is not None and isinstance(channel, (
+                discord.TextChannel, discord.ForumChannel,
+            )):
+                archive_client = verify_client
+            elif isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                archive_client = None
+            else:
+                archive_client = None
+                still_archived = True
+            try:
+                if isinstance(channel, (
+                    discord.TextChannel, discord.ForumChannel,
+                    discord.VoiceChannel, discord.StageChannel,
+                )):
+                    still_archived = await is_channel_archived(archive_client, channel)
+            except Exception:
+                still_archived = False
+            if not still_archived:
+                remedy = (
+                    "persistent text chat is not empty/unverifiable"
+                    if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+                    else "archive is stale or unverified — re-run /publish"
+                )
+                failures.append(f"channel `{channel.name}`: {remedy} (not deleted)")
+                logging.warning("Skipped deleting #%s (%s): archive stale/unverified at confirm time.", channel.name, channel.id)
+                continue
+            try:
+                await _delete_discord_pacer.run(
+                    f"delete channel #{channel.name}",
+                    lambda channel=channel: channel.delete(
+                        reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})"),
+                )
+                deleted_channels.append(channel.name)
+                deleted_channel_ids.add(channel.id)
+                logging.info("Channel '%s' (%s) deleted by %s (%s).", channel.name, channel.id, interaction.user, interaction.user.id)
+            except Exception as e:
+                failures.append(f"channel `{channel.name}`: {e}")
+                logging.exception("Failed deleting channel '%s' (%s).", channel.name, channel.id)
+
+        # Categories are removed after all selected child channels have been attempted.
+        for category in self.categories:
+            # Deleting a category leaves its remaining channels uncategorised rather
+            # than deleting them. If any selected child was skipped or failed above,
+            # keep the category so that surviving child is not silently moved out of
+            # it — honouring the "no selected children left behind" guarantee.
+            # Consult the category's current children, not only the confirmation
+            # snapshot. This also catches a channel created/moved into the category
+            # during the confirmation window. Deleted objects can briefly remain in
+            # cache, so exclude ids whose deletion already succeeded.
+            surviving = [c for c in category.channels if c.id not in deleted_channel_ids]
+            if surviving:
+                failures.append(
+                    f"category `{category.name}`: kept — {len(surviving)} selected child channel(s) were not deleted")
+                logging.warning("Kept category '%s' (%s): %d selected child(ren) not deleted.", category.name, category.id, len(surviving))
+                continue
+            try:
+                await _delete_discord_pacer.run(
+                    f"delete category {category.name}",
+                    lambda category=category: category.delete(
+                        reason=f"Bulk deletion requested by {interaction.user} ({interaction.user.id})"),
+                )
+                deleted_categories.append(category.name)
+                logging.info("Category '%s' (%s) deleted by %s (%s).", category.name, category.id, interaction.user, interaction.user.id)
+            except Exception as e:
+                failures.append(f"category `{category.name}`: {e}")
+                logging.exception("Failed deleting category '%s' (%s).", category.name, category.id)
+
+        # Replace the confirmation prompt with the final result.
+        lines = [f"Deletion complete: {len(deleted_categories)} categor{'y' if len(deleted_categories) == 1 else 'ies'} and {len(deleted_channels)} channel{'s' if len(deleted_channels) != 1 else ''} deleted."]
+        if failures:
+            lines.append("Failures:")
+            lines.extend(f"- {failure}" for failure in failures[:15])
+            if len(failures) > 15:
+                lines.append(f"- …and {len(failures) - 15} more failure(s); see the bot log.")
+        chunks = _paginate_lines(lines)
+        await interaction.edit_original_response(content=chunks[0], view=self)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Cancel the pending deletion without changing the server."""
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Deletion cancelled. Nothing was deleted.", view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        """Disable the local controls when the 60-second confirmation window expires."""
+        for child in self.children:
+            child.disabled = True
+
+
+# ---- /delete command (bulk category/channel deletion with confirmation) ----
+@tree.command(name="delete", description="Bulk-delete channels, categories, or both by name.")
+@app_commands.describe(
+    target_type="What kind of targets to delete",
+    targets="Comma-separated list of channel/category names"
+)
+@app_commands.choices(target_type=[
+    app_commands.Choice(name="Category", value="category"),
+    app_commands.Choice(name="Channel", value="channel"),
+    app_commands.Choice(name="Both", value="both"),
+])
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def delete(interaction: discord.Interaction, target_type: app_commands.Choice[str], targets: str):
+    """Resolve requested Discord channels/categories and request deletion confirmation.
+
+    `targets` is a comma-separated list matched case-insensitively by exact
+    Discord name. Category mode selects each matching category plus all child
+    channels. Channel mode selects only matching non-category channels. Both
+    mode allows either kind of target. No destructive action occurs until the
+    invoking member presses the confirmation button.
+    """
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+        return
+
+    # The decorator controls command visibility, while this runtime check also
+    # protects execution if Discord's cached command permissions are stale.
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.followup.send("You need the Manage Channels permission to use `/delete`.", ephemeral=True)
+        return
+
+    # Normalize the comma-separated input while preserving original spelling
+    # for useful missing-target messages.
+    names = [name.strip() for name in targets.split(",") if name.strip()]
+    if not names:
+        await interaction.followup.send("Provide at least one channel or category name.", ephemeral=True)
+        return
+
+    # Case-insensitive exact-name matching. Duplicate names are all included so
+    # the confirmation accurately represents what Discord will delete.
+    wanted = {name.casefold() for name in names}
+    matched_categories = []
+    matched_channels = []
+
+    # Resolve categories when Category or Both mode was selected.
+    if target_type.value in ("category", "both"):
+        matched_categories = [category for category in guild.categories if category.name.casefold() in wanted]
+
+    # Resolve every non-category Discord channel type in Channel or Both mode.
+    if target_type.value in ("channel", "both"):
+        matched_channels = [channel for channel in guild.channels if not isinstance(channel, discord.CategoryChannel) and channel.name.casefold() in wanted]
+
+    # Selecting a category means deleting the category and everything in it.
+    # Include all channel types exposed through CategoryChannel.channels.
+    for category in matched_categories:
+        for channel in category.channels:
+            if channel not in matched_channels:
+                matched_channels.append(channel)
+
+    # Determine which user-supplied names never resolved to an applicable target.
+    found_names = {category.name.casefold() for category in matched_categories}
+    found_names.update(channel.name.casefold() for channel in matched_channels)
+    missing = [name for name in names if name.casefold() not in found_names]
+
+    if not matched_categories and not matched_channels:
+        await interaction.followup.send("No matching channels or categories were found. Nothing was deleted.", ephemeral=True)
+        return
+
+    # Safety gate: text/forum channels require a verified archive. Voice/stage
+    # channels must at least have empty persistent text chat; unsupported forums
+    # remain blocked by is_channel_archived.
+    voice_stage_targets = [
+        ch for ch in matched_channels
+        if isinstance(ch, (discord.VoiceChannel, discord.StageChannel))
+    ]
+    wiki_targets = [
+        ch for ch in matched_channels
+        if isinstance(ch, (discord.TextChannel, discord.ForumChannel))
+    ]
+    unarchived = [
+        ch for ch in voice_stage_targets
+        if not await is_channel_archived(None, ch)
+    ]
+    if wiki_targets:
+        try:
+            wiki = await get_wiki_client()
+        except Exception as exc:
+            await interaction.followup.send(
+                f"🛑 Cannot verify wiki archives ({exc}). Deletion blocked for safety.", ephemeral=True)
+            return
+        # A generator expression containing ``await`` is an async generator,
+        # which ``list.extend`` cannot consume.  Verify sequentially so the
+        # MediaWiki client is not used concurrently and append failures
+        # explicitly.
+        for ch in wiki_targets:
+            if not await is_channel_archived(wiki, ch):
+                unarchived.append(ch)
+    if unarchived:
+        listing = ", ".join(f"`{ch.name}`" for ch in unarchived[:20])
+        more = "" if len(unarchived) <= 20 else f" (+{len(unarchived) - 20} more)"
+        await interaction.followup.send(
+            "🛑 Deletion blocked — these channels are not safely archived/empty:\n"
+            f"{listing}{more}\n\nPublish text channels first; voice/stage text chat must be empty, and forums are unsupported.",
+            ephemeral=True,
+        )
+        return
+
+    # List categories and explicitly selected standalone channels separately;
+    # child channels are represented by the total count to keep the prompt sane.
+    category_names = ", ".join(f"`{category.name}`" for category in matched_categories) or "None"
+    standalone_channels = [channel for channel in matched_channels if channel.category not in matched_categories]
+    channel_names = ", ".join(f"`{channel.name}`" for channel in standalone_channels) or "None"
+
+    # Present the complete impact before creating the destructive controls.
+    message = (
+        "**Permanent deletion confirmation**\n"
+        f"This will permanently delete **{len(matched_categories)}** categor{'y' if len(matched_categories) == 1 else 'ies'} "
+        f"and **{len(matched_channels)}** channel{'s' if len(matched_channels) != 1 else ''}.\n\n"
+        f"Categories: {category_names}\n"
+        f"Standalone channels: {channel_names}"
+    )
+    if missing:
+        message += "\n\nNot found: " + ", ".join(f"`{name}`" for name in missing)
+    message += "\n\nThis cannot be undone."
+
+    # Log both the original request and the resolved Discord objects for auditability.
+    logging.info("Delete requested by %s (%s): type=%s targets=%s; resolved categories=%s channels=%s missing=%s", interaction.user, interaction.user.id, target_type.value, names, [c.name for c in matched_categories], [c.name for c in matched_channels], missing)
+
+    # Only the invoking member can activate this confirmation view.
+    view = DeleteConfirmationView(interaction.user.id, matched_channels, matched_categories)
+    await interaction.followup.send(message, view=view, ephemeral=True)
+
+
+# ---- Command help registry (drives /help and the admin guide) ----
+COMMAND_HELP = {
+    "publish": {
+        "summary": "Archive channel(s) to the wiki — a channel, a whole category, category names, or a name list.",
+        "usage": "/publish [channel:<#channel>] [category:<category>] [categories:<name,name,...>] [channels:<name,name,...>]",
+        "params": [
+            "channel — (optional) a single text channel.",
+            "category — (optional) archive every text channel in this category.",
+            "categories — (optional) comma-separated category names, processed in the order given.",
+            "channels — (optional) comma-separated channel names to archive.",
+            "With none given, archives the channel you run it in. Inputs combine and de-duplicate.",
+        ],
+        "examples": [
+            "/publish",
+            "/publish channel:#cpt-257-summer-2023",
+            "/publish category:Summer 2023 Archive",
+            "/publish categories:Summer 2024 Archive, Fall 2024 Archive, Spring 2025 Archive",
+            "/publish channels:cpt-257-summer-2023, ist-201-summer-2023",
+        ],
+        "notes": (
+            "Run /archive first: any still-writable target aborts the whole request, and a missing or ambiguous "
+            "category name does too. Channels already archived and current are skipped untouched; incomplete "
+            "archives reuse intact uploads and existing #archives announcements instead of duplicating them. For "
+            "each new channel the bot reads parent + thread history, uploads attachments, stages "
+            "Archive:DEPT-NUM/Term Year (or Archive:Misc/<name>), posts the link to #archives, then adds and "
+            "verifies deletion clearance. Completely empty channels create no individual stub; after a second empty "
+            "check they are recorded on Archive:Skipped. Failures remain blocked. Requires Manage Channels."
+        ),
+    },
+    "delete": {
+        "summary": "Permanently delete channels and/or categories (guarded by confirmation and wiki archive).",
+        "usage": "/delete target_type:<Category|Channel|Both> targets:<comma,separated,names>",
+        "params": [
+            "target_type — Category (a category + all its channels), Channel (named channels only), or Both.",
+            "targets — comma-separated, exact channel/category names (case-insensitive).",
+        ],
+        "examples": [
+            "/delete target_type:Channel targets:cpt-257-summer-2023, ist-201-summer-2023",
+            "/delete target_type:Category targets:Summer 2023 Archive",
+        ],
+        "notes": (
+            "SAFETY: every non-empty text channel must have a current verified archive. A channel recorded on "
+            "Archive:Skipped is accepted only if its parent and every thread are freshly verified empty. "
+            "Forum channels are unsupported and blocked, while voice/stage channels are allowed only when their "
+            "persistent text chat is empty. A 60-second confirmation rechecks both current content and the "
+            "requester's Manage Channels permission. Deletion is permanent."
+        ),
+    },
+    "publish_help_placeholder": None,  # (kept intentionally out; see below)
+    "archive": {
+        "summary": "Move a term's Discord channels into an archive category and lock them to read-only.",
+        "usage": "/archive term:<Spring|Summer|Fall> year:<YYYY>",
+        "params": [
+            "term — Spring, Summer, or Fall.",
+            "year — 4-digit year, e.g. 2025.",
+        ],
+        "examples": ["/archive term:Summer year:2023"],
+        "notes": (
+            "Discord-side only: moves channels whose name contains -<term>-<year> into a '<Term> <Year> Archive' "
+            "category and grants the Verified role read-only access. This does NOT publish to the wiki — use "
+            "/publish for the permanent wiki archive."
+        ),
+    },
+    "populate": {
+        "summary": "Create course channels under a category, each restricted to its course role.",
+        "usage": "/populate category:<CPT|CYB|IST|SPC|SOC|HSS|HIS> term:<Spring|Summer|Fall> year:<YYYY> courses:<nums>",
+        "params": [
+            "category — department (CPT, CYB, IST, SPC, SOC, HSS, HIS).",
+            "term — Spring, Summer, or Fall.",
+            "year — 4-digit year.",
+            "courses — comma-separated course numbers, e.g. 113, 127, 170.",
+        ],
+        "examples": [
+            "/populate category:CPT term:Spring year:2027 courses:113, 127, 170, 209",
+        ],
+        "notes": (
+            "Each channel <DEPT>-<num>-<Term>-<Year> is created private to the matching <DEPT>-<num> role (which "
+            "must already exist — see /add_role) plus Lab Tech. Missing course roles are skipped with a warning."
+        ),
+    },
+    "add_role": {
+        "summary": "Create or update course roles for a department with the standard student permission set.",
+        "usage": "/add_role category:<CPT|CYB|IST|SPC|SOC|HSS|HIS> courses:<nums>",
+        "params": [
+            "category — department prefix.",
+            "courses — comma-separated course numbers.",
+        ],
+        "examples": ["/add_role category:CYB courses:110, 201, 269"],
+        "notes": (
+            "Creates <DEPT>-<num> roles that are missing and syncs permissions on existing ones. Run this before "
+            "/populate so the channels can be locked to their course roles. Requires Manage Roles."
+        ),
+    },
+    "wiki_status": {
+        "summary": "Check the archive wiki connection and the bot's wiki permissions.",
+        "usage": "/wiki_status",
+        "params": [],
+        "examples": ["/wiki_status"],
+        "notes": "Reports the MediaWiki version, the bot's wiki user/groups, whether it can edit and upload, and the archive namespace. Requires Manage Channels.",
+    },
+    "help": {
+        "summary": "List all commands, or show detailed help and examples for one.",
+        "usage": "/help [command:<name>]",
+        "params": ["command — (optional) a command name to get full details for."],
+        "examples": ["/help", "/help command:publish"],
+        "notes": "With no argument, lists every command. With a command name, shows its usage, parameters, examples, and notes.",
+    },
+}
+# Drop the placeholder key used only to keep insertion order readable.
+COMMAND_HELP.pop("publish_help_placeholder", None)
+
+# Order commands are listed in /help (grouped: wiki, then Discord management, then help).
+_HELP_ORDER = ["publish", "wiki_status", "delete", "archive", "populate", "add_role", "help"]
+
+
+@tree.command(name="help", description="List all bot commands, or get detailed help for one.")
+@app_commands.describe(command="(optional) a specific command to get full help for")
+@app_commands.choices(command=[app_commands.Choice(name=c, value=c) for c in _HELP_ORDER])
+@app_commands.guild_only()
+async def help_command(interaction: discord.Interaction, command: app_commands.Choice[str] | None = None):
+    await interaction.response.defer(ephemeral=True)
+    if command is None:
+        lines = ["**GTC Archive Bot — command list**", ""]
+        for name in _HELP_ORDER:
+            info = COMMAND_HELP.get(name)
+            if info:
+                lines.append(f"• **/{name}** — {info['summary']}")
+        lines.append("")
+        lines.append("Use `/help command:<name>` for usage, parameters, and examples.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    info = COMMAND_HELP.get(command.value)
+    if not info:
+        await interaction.followup.send(f"No help found for `/{command.value}`.", ephemeral=True)
+        return
+    lines = [f"**/{command.value}** — {info['summary']}", "", f"**Usage:** `{info['usage']}`"]
+    if info.get("params"):
+        lines.append("")
+        lines.append("**Parameters:**")
+        lines.extend(f"• {p}" for p in info["params"])
+    if info.get("examples"):
+        lines.append("")
+        lines.append("**Examples:**")
+        lines.extend(f"`{e}`" for e in info["examples"])
+    if info.get("notes"):
+        lines.append("")
+        lines.append(f"**Notes:** {info['notes']}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+# ---- publish helper (archive one channel to the wiki, with read-back verification) ----
+def _edit_matches_readback(edit: dict, page: dict | None) -> bool:
+    """True when a MediaWiki edit result matches the revision read back."""
+    nochange = edit.get("result") == "Nochange" or (
+        edit.get("result") == "Success" and "nochange" in edit
+    )
+    return bool(nochange or (page and page["revid"] == edit.get("newrevid")))
+
+
+async def publish_channel_to_wiki(client: MediaWikiClient, channel: discord.TextChannel) -> dict:
+    """Capture and stage one channel on the wiki for announcement/finalisation.
+
+    The canonical page is first saved *without* its deletion-clearance marker.
+    `/publish` adds that marker only after the required #archives announcement
+    succeeds, eliminating the window where `/delete` could clear a page whose
+    announcement later failed (or whose failure marker could not be persisted).
+    """
+    # Only capture a frozen channel. Publishing a still-writable channel is racy:
+    # a message posted mid-capture can be missed, yet marked archived and deletable.
+    # `/archive` locks channels read-only, so this enforces the archive→publish order.
+    if not _is_locked_readonly(channel):
+        raise WikiError("channel is still writable — run /archive to lock it read-only before publishing")
+    capture_started = datetime.datetime.now(datetime.timezone.utc)
+    messages, capture_complete = await capture_channel(channel)
+    real_messages = [m for m in messages if not m.get("thread_header")]
+
+    # A completely verified empty channel has no content worth a dedicated wiki
+    # stub. Record it on the shared list only after the required #archives
+    # announcement and a second live emptiness check. If enumeration failed, do
+    # not create either a misleading empty record or an incomplete blank page.
+    if not real_messages:
+        if not capture_complete:
+            raise WikiError(
+                "channel appears empty, but parent/thread history could not be fully verified"
+            )
+        existing_record = await _empty_record_for_channel(client, channel)
+        title = empty_archive.list_page_title(
+            WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+        )
+        result = {
+            "channel": channel,
+            "empty": True,
+            "ok": existing_record is not None,
+            "ready": existing_record is None,
+            "title": title,
+            "url": empty_channel_list_url(channel.id),
+            "messages": 0,
+            "attachments": 0,
+            "complete": True,
+            "error": None,
+        }
+        if existing_record is None:
+            result["_empty_record"] = empty_archive.make_record(
+                guild_id=channel.guild.id,
+                channel_id=channel.id,
+                channel_name=channel.name,
+                category_name=channel.category.name if channel.category else "",
+                verified_at=_format_capture_time(capture_started),
+            )
+        return result
+
+    namespace = WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"]
+    title = discord_export.make_page_title(channel.name, namespace)
+    # Fetch the owned canonical page BEFORE uploading so a re-publish of an
+    # incomplete archive can reuse still-intact attachments instead of resubmitting
+    # every file. Only a page whose integrity seal still validates is trusted as
+    # the reuse source; a tampered/broken page forces a full re-upload.
+    canonical_page = await _require_owned_or_missing_page(
+        client, title, channel.id, channel.name,
+    )
+    existing_manifest = None
+    existing_external = None
+    if canonical_page and discord_export.verify_canonical_content(canonical_page["content"]):
+        parsed_manifest = discord_export.parse_attachment_manifest(canonical_page["content"])
+        if parsed_manifest:
+            existing_manifest = {
+                name: (sha1, size) for name, sha1, size in parsed_manifest
+            }
+        parsed_external = discord_export.parse_external_manifest(canonical_page["content"])
+        if parsed_external:
+            existing_external = {
+                name: (sha1, size) for name, sha1, size in parsed_external
+            }
+    attachment_stats = await archive_attachments(
+        client, channel.name, messages,
+        existing_manifest=existing_manifest, existing_external=existing_external,
+    )
+    uploaded = attachment_stats["archived"]
+    thread_names = {
+        m["id"]: m["thread_header"]
+        for m in messages
+        if m.get("thread_header")
+    }
+    stream_boundaries = {channel.id: 0}
+    for message in messages:
+        if message.get("thread_header"):
+            stream_boundaries.setdefault(message["id"], 0)
+            continue
+        stream_id = message.get("stream_id", channel.id)
+        stream_boundaries[stream_id] = max(stream_boundaries.get(stream_id, 0), message["id"])
+    meta = {
+        "channel_id": channel.id,
+        # Capture *start* (not end/upload time) makes any edit during capture or
+        # attachment upload newer than the marker and therefore blocks deletion.
+        "captured_at": _format_capture_time(capture_started),
+        "captured_until": max((m["id"] for m in real_messages), default=0),
+        "stream_boundaries": stream_boundaries,
+        "thread_names": thread_names,
+        "message_count": len(real_messages),
+        # Incomplete if any attachment failed OR thread enumeration/read failed;
+        # an incomplete archive omits the completion marker and blocks deletion.
+        "complete": capture_complete and all("error" not in att for m in messages for att in m["attachments"]),
+    }
+    course_match = re.match(r"^([a-z]+)-(\d+)-(spring|summer|fall)-(\d{4})$", channel.name.strip(), re.I)
+    if course_match:
+        meta["category"] = f"{course_match.group(1).upper()}-{course_match.group(2)}"
+    parts = discord_export.split_messages(
+        messages, channel.name, meta, page_title=title,
+    )
+    if course_match:
+        course = f"{course_match.group(1).upper()}-{course_match.group(2)}"
+        department = course_match.group(1).upper()
+        for category_title, category_text in (
+            (f"Category:{course}", f"[[Category:{department}]]\n"),
+            (f"Category:{department}", "[[Category:Discord archive]]\n"),
+        ):
+            try:
+                await client.edit_page(category_title, category_text, "Create archive category", createonly=True)
+            except WikiError as exc:
+                if "articleexists" not in str(exc).lower():
+                    raise
+    part_manifest: list[tuple[int, str]] = []
+    if len(parts) > 1:
+        # Map each message id to the part page that holds it, so cross-part reply
+        # links target the correct page instead of a dead same-page anchor.
+        part_titles = [f"{title}/Part {idx}" for idx in range(1, len(parts) + 1)]
+        anchor_index = {
+            m["id"]: part_titles[i]
+            for i, part in enumerate(parts)
+            for m in part
+            if not m.get("thread_header")
+        }
+        # Preflight every target before changing any part, so a collision on a
+        # later part cannot leave earlier parts partially overwritten.
+        existing_parts = {}
+        for idx, part_title in enumerate(part_titles, 1):
+            existing_parts[part_title] = await _require_owned_or_missing_page(
+                client,
+                part_title,
+                channel.id,
+                channel.name,
+                legacy_part_number=idx,
+            )
+        for idx, part in enumerate(parts, 1):
+            part_title = part_titles[idx - 1]
+            existing_part = existing_parts[part_title]
+            part_text = discord_export.render_page(
+                channel.name, part, {**meta, "complete": False},
+                part=True, anchor_index=anchor_index, self_title=part_title,
+            )
+            part_edit = await client.edit_page(
+                part_title, part_text, f"Archive part {idx} for #{channel.name}",
+                createonly=existing_part is None,
+                baserevid=existing_part["revid"] if existing_part else None,
+            )
+            saved_part = await client.get_page(part_title)
+            if not (saved_part
+                    and _page_owner_id(saved_part["content"]) == channel.id
+                    and _edit_matches_readback(part_edit, saved_part)):
+                raise WikiError(f"archive part {idx} failed read-back verification")
+            part_manifest.append((
+                idx,
+                discord_export.content_sha256(saved_part["content"]),
+            ))
+        links = "\n".join(f"* [[{pt}|Part {i}]]" for i, pt in enumerate(part_titles, 1))
+        # index=True suppresses the "no messages" notice on the canonical index page.
+        final_text = discord_export.render_page(channel.name, [], meta, index=True) + f"\n\n== Archive parts ==\n{links}\n"
+        staged_text = discord_export.render_page(
+            channel.name, [], {**meta, "complete": False}, index=True
+        ) + f"\n\n== Archive parts ==\n{links}\n"
+    else:
+        anchor_index = {m["id"]: title for m in real_messages}
+        final_text = discord_export.render_page(
+            channel.name, messages, meta, anchor_index=anchor_index, self_title=title,
+        )
+        staged_text = discord_export.render_page(
+            channel.name, messages, {**meta, "complete": False},
+            anchor_index=anchor_index, self_title=title,
+        )
+    attachment_manifest = sorted(
+        (
+            att["wiki_filename"],
+            att["wiki_sha1"],
+            att["wiki_size"],
+        )
+        for message in messages
+        for att in message["attachments"]
+        if "error" not in att and not att.get("external")
+    )
+    external_manifest = sorted(
+        (
+            att["nas_filename"],
+            att["nas_sha1"],
+            att["nas_size"],
+        )
+        for message in messages
+        for att in message["attachments"]
+        if "error" not in att and att.get("external")
+    )
+    manifest_text = discord_export.render_part_manifest(part_manifest)
+    attachment_text = discord_export.render_attachment_manifest(attachment_manifest)
+    external_text = discord_export.render_external_manifest(external_manifest)
+    final_text = f"{final_text}\n{manifest_text}\n{attachment_text}\n{external_text}\n"
+    final_text = discord_export.seal_canonical_content(final_text)
+    staged_text = f"{staged_text}\n{manifest_text}\n{attachment_text}\n{external_text}\n"
+    edit = await client.edit_page(
+        title, staged_text, f"Stage archive #{channel.name} ({len(real_messages)} messages)",
+        createonly=canonical_page is None,
+        baserevid=canonical_page["revid"] if canonical_page else None,
+    )
+    page = await client.get_page(title)
+    saved_owner = _OWNER_MARKER_RE.search(page["content"]) if page else None
+    owner_present = bool(saved_owner and int(saved_owner.group(1)) == channel.id)
+    saved_manifest = discord_export.parse_part_manifest(page["content"] if page else "")
+    saved_attachments = discord_export.parse_attachment_manifest(page["content"] if page else "")
+    saved_external = discord_export.parse_external_manifest(page["content"] if page else "")
+    staged_parts_match = await _archive_parts_match(
+        client, title, channel.id, part_manifest
+    )
+    staged_attachments_match = await _archive_attachments_match(
+        client, attachment_manifest
+    )
+    staged_external_match = await _archive_external_attachments_match(external_manifest)
+    staged_verified = bool(
+        owner_present
+        and _edit_matches_readback(edit, page)
+        and saved_manifest == part_manifest
+        and saved_attachments == attachment_manifest
+        and saved_external == external_manifest
+        and staged_parts_match
+        and staged_attachments_match
+        and staged_external_match
+    )
+    ready = bool(meta["complete"] and staged_verified)
+    if not meta["complete"]:
+        error = "capture or attachment archiving was incomplete"
+    elif not staged_verified:
+        error = "staged archive failed read-back verification"
+    else:
+        error = None
+    return {
+        "channel": channel, "ok": False, "ready": ready,
+        "title": title, "url": wiki_page_url(title),
+        "messages": meta["message_count"], "attachments": uploaded,
+        "uploaded_attachments": attachment_stats["uploaded"],
+        "reused_attachments": attachment_stats["reused"],
+        "nas_attachments": attachment_stats["nas_uploaded"] + attachment_stats["nas_reused"],
+        "revid": page["revid"] if page else None,
+        "complete": meta["complete"],
+        "error": error,
+        "_final_text": final_text if ready else None,
+        "_stream_boundaries": stream_boundaries,
+        "_part_manifest": part_manifest,
+        "_attachment_manifest": attachment_manifest,
+        "_external_manifest": external_manifest,
+    }
+
+
+async def finalize_archive(client: MediaWikiClient, result: dict) -> None:
+    """Add deletion clearance after announcement and verify it from the wiki."""
+    final_text = result.pop("_final_text", None)
+    expected_streams = result.pop("_stream_boundaries", {})
+    expected_parts = result.pop("_part_manifest", [])
+    expected_attachments = result.pop("_attachment_manifest", [])
+    expected_external = result.pop("_external_manifest", [])
+    if not final_text:
+        raise WikiError("archive was not ready for finalisation")
+    if not await _archive_parts_match(
+        client, result["title"], result["channel"].id, expected_parts
+    ):
+        raise WikiError("archive parts changed before finalisation")
+    if not await _archive_attachments_match(client, expected_attachments):
+        raise WikiError("archived attachments changed before finalisation")
+    if not await _archive_external_attachments_match(expected_external):
+        raise WikiError("NAS-hosted attachments changed before finalisation")
+    edit = await client.edit_page(
+        result["title"], final_text,
+        f"Finalise announced archive #{result['channel'].name}",
+        baserevid=result.get("revid"),
+    )
+    page = await client.get_page(result["title"])
+    marker_present = bool(
+        page and _archive_marker_re(result["channel"].id).search(page["content"])
+    )
+    saved_owner = _OWNER_MARKER_RE.search(page["content"]) if page else None
+    owner_matches = bool(
+        saved_owner and int(saved_owner.group(1)) == result["channel"].id
+    )
+    saved_streams = {
+        int(stream_id): int(boundary)
+        for stream_id, boundary in _STREAM_MARKER_RE.findall(page["content"] if page else "")
+    }
+    saved_parts = discord_export.parse_part_manifest(page["content"] if page else "")
+    saved_attachments = discord_export.parse_attachment_manifest(page["content"] if page else "")
+    saved_external = discord_export.parse_external_manifest(page["content"] if page else "")
+    parts_match = await _archive_parts_match(
+        client, result["title"], result["channel"].id, expected_parts
+    )
+    attachments_match = await _archive_attachments_match(
+        client, expected_attachments
+    )
+    external_match = await _archive_external_attachments_match(expected_external)
+    if not (_edit_matches_readback(edit, page)
+            and owner_matches
+            and marker_present
+            and saved_streams == expected_streams
+            and saved_parts == expected_parts
+            and saved_attachments == expected_attachments
+            and saved_external == expected_external
+            and parts_match
+            and attachments_match
+            and external_match
+            and discord_export.verify_canonical_content(page["content"] if page else "")):
+        raise WikiError("final archive failed read-back verification")
+    result["revid"] = page["revid"]
+    result["ok"] = True
+    result["error"] = None
+
+
+async def finalize_empty_archive(client: MediaWikiClient, result: dict) -> None:
+    """Record an announced empty channel after rechecking every message stream."""
+    record = result.pop("_empty_record", None)
+    channel = result["channel"]
+    if not record:
+        raise WikiError("empty channel was not ready for finalisation")
+    if not _is_locked_readonly(channel):
+        raise WikiError("empty channel is no longer locked read-only")
+    try:
+        still_empty = await empty_archive.is_completely_empty(channel, _iter_threads)
+    except Exception as exc:
+        raise WikiError(f"could not re-verify empty channel history: {exc}") from exc
+    if not still_empty:
+        raise WikiError("channel received a message before empty-record finalisation")
+
+    saved = await empty_archive.insert_record(
+        client,
+        WIKI_CONFIG["MEDIAWIKI_ARCHIVE_NAMESPACE"],
+        record,
+    )
+    saved_records = empty_archive.parse_empty_channel_list(saved.get("content", ""))
+    if not saved_records or saved_records.get(channel.id) != record:
+        raise WikiError("empty-channel record failed final read-back verification")
+    result["revid"] = saved["revid"]
+    result["ok"] = True
+    result["error"] = None
+
+
+# ---- /publish command (single channel, a whole category, and/or a name list) ----
+@tree.command(name="publish", description="Archive channel(s) to the wiki: a channel, a category, category names, or a name list.")
+@app_commands.describe(
+    channel="A single text channel to archive",
+    category="Archive every text channel in this category",
+    categories="Comma-separated category names to archive, in the given order",
+    channels="Comma-separated channel names to archive",
+)
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def publish(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+    category: discord.CategoryChannel | None = None,
+    categories: str | None = None,
+    channels: str | None = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    # default_permissions only sets Discord's initial command visibility, which a
+    # guild admin can override or leave stale. Enforce Manage Channels at runtime
+    # before resolving/capturing any target, so an ordinary member cannot use the
+    # free-form channels selector to make the bot read and publish a private
+    # channel they cannot access.
+    if guild is None or not interaction.user.guild_permissions.manage_channels:
+        await interaction.followup.send("You need the Manage Channels permission to use `/publish`.", ephemeral=True)
+        return
+
+    # ---- Resolve the ordered target set with a source label for each channel ----
+    # Entries are (channel, source_label); the label is the category a channel came
+    # from and only drives progress logging. Category-list order is preserved, and
+    # each category's channels follow their Discord position order.
+    ordered: list[tuple[discord.TextChannel, str]] = []
+    selector_supplied = (
+        channel is not None
+        or category is not None
+        or bool(categories and categories.strip())
+        or bool(channels and channels.strip())
+    )
+    if channel is not None:
+        ordered.append((channel, channel.category.name if channel.category else ""))
+    if category is not None:
+        for member in category.text_channels:
+            ordered.append((member, category.name))
+
+    # Category name list: resolve case-insensitively. A missing OR ambiguous
+    # (duplicate) category name aborts the WHOLE request before any wiki work,
+    # so a typo can never publish a partial, surprising subset.
+    if categories:
+        wanted_categories = discord_export.parse_name_list(categories)
+        resolution_errors: list[str] = []
+        for name in wanted_categories:
+            matches = [cat for cat in guild.categories if cat.name.casefold() == name]
+            if not matches:
+                resolution_errors.append(f"no category named `{name}`")
+            elif len(matches) > 1:
+                resolution_errors.append(f"`{name}` is ambiguous — {len(matches)} categories share that name")
+            else:
+                for member in matches[0].text_channels:
+                    ordered.append((member, matches[0].name))
+        if resolution_errors:
+            await interaction.followup.send(
+                "❌ Category list could not be resolved — nothing was published:\n"
+                + "\n".join(f"• {err}" for err in resolution_errors),
+                ephemeral=True,
+            )
+            return
+
+    # Channel name list. Unmatched names are reported (non-fatal) alongside the
+    # final summary rather than aborting names that did resolve.
+    missing_channel_names: list[str] = []
+    if channels:
+        wanted = set(discord_export.parse_name_list(channels))
+        found = {c.name.casefold() for c in guild.text_channels}
+        for member in guild.text_channels:
+            if member.name.casefold() in wanted:
+                ordered.append((member, member.category.name if member.category else ""))
+        missing_channel_names = sorted(wanted - found)
+
+    # Default to the current channel only when NO selector was supplied.
+    if not ordered and not selector_supplied and isinstance(interaction.channel, discord.TextChannel):
+        current = interaction.channel
+        ordered.append((current, current.category.name if current.category else ""))
+
+    # De-duplicate by channel id, preserving first occurrence and its label.
+    seen_ids: set[int] = set()
+    targets: list[tuple[discord.TextChannel, str]] = []
+    for member, label in ordered:
+        if member.id not in seen_ids:
+            seen_ids.add(member.id)
+            targets.append((member, label))
+    if not targets:
+        note = ""
+        if missing_channel_names:
+            note = " Unmatched names: " + ", ".join(f"`{n}`" for n in missing_channel_names)
+        await interaction.followup.send("No text channels to publish." + note, ephemeral=True)
+        return
+
+    # ---- Preflight: every target must be locked read-only before any wiki work ----
+    # A single writable target aborts the whole request; publishing a channel that
+    # can still receive messages is racy and could mark uncaptured history deletable.
+    writable = [member for member, _label in targets if not _is_locked_readonly(member)]
+    if writable:
+        shown = ", ".join(f"#{member.name}" for member in writable[:40])
+        overflow = "" if len(writable) <= 40 else f" …(+{len(writable) - 40} more)"
+        await interaction.followup.send(
+            "❌ These channels are still writable — run `/archive` to lock them first. "
+            "Nothing was published:\n" + shown + overflow,
+            ephemeral=True,
+        )
+        return
+
+    try:
+        client = await get_wiki_client()
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Wiki unavailable: {exc}", ephemeral=True)
+        return
+
+    # Read the bot's own #archives announcements once so an already-announced
+    # archive is reused instead of re-announced. Only the bot's messages are
+    # trusted; a user-authored lookalike must never satisfy the announcement gate.
+    # If history cannot be fully read, fail closed: channels that would need a
+    # fresh announcement are left unverified rather than risking a duplicate.
+    archives_channel = discord.utils.get(guild.text_channels, name="archives")
+    # Collect the exact URL tokens the bot has already announced. Whitespace-token
+    # membership (not substring) is required so e.g. #empty-channel-12 cannot match
+    # a #empty-channel-123 announcement; archive URLs never contain whitespace.
+    announced_urls: set[str] = set()
+    announcements_readable = True
+    if archives_channel is not None:
+        bot_id = bot.user.id if bot.user else None
+        try:
+            async for message in archives_channel.history(limit=None):
+                if bot_id is not None and message.author.id == bot_id and message.content:
+                    announced_urls.update(message.content.split())
+        except Exception as exc:
+            logging.warning("Could not read #archives history; failing closed on announcements: %s", exc)
+            announcements_readable = False
+
+    total = len(targets)
+    await interaction.followup.send(
+        f"⏳ Reconciling {total} channel(s) with the wiki… results post to #archives as they finish.",
+        ephemeral=True,
+    )
+
+    results = []
+    counts = {"unchanged": 0, "published": 0, "empty": 0, "failed": 0}
+    for index, (ch, label) in enumerate(targets, 1):
+        label_note = f" [{label}]" if label else ""
+        logging.info("Publish %d/%d%s: reconciling #%s.", index, total, label_note, ch.name)
+
+        # Fast path: an already-verified, current archive is left completely
+        # untouched — no capture, upload, edit, or announcement.
+        try:
+            already_archived = await is_channel_archived(client, ch)
+        except Exception as exc:
+            logging.warning("Archive fast-path check failed for #%s: %s", ch.name, exc)
+            already_archived = False
+        if already_archived:
+            counts["unchanged"] += 1
+            logging.info("Publish %d/%d%s: #%s already archived and current — unchanged.", index, total, label_note, ch.name)
+            results.append({"channel": ch, "ok": True, "unchanged": True, "label": label})
+            continue
+
+        try:
+            result = await publish_channel_to_wiki(client, ch)
+        except Exception as exc:
+            logging.exception("publish failed for #%s", ch.name)
+            result = {"channel": ch, "ok": False, "error": str(exc)}
+        result["label"] = label
+        results.append(result)
+
+        if result.get("ready") and archives_channel is not None:
+            url = result.get("url", "")
+            already_announced = announcements_readable and bool(url) and url in announced_urls
+            announced_ok = already_announced
+            if already_announced:
+                result["announcement_reused"] = True
+                logging.info("Publish %d/%d%s: reusing existing #archives announcement for #%s.", index, total, label_note, ch.name)
+            elif not announcements_readable:
+                result["announcement_error"] = "could not read #archives history to avoid a duplicate announcement"
+                result["error"] = result["announcement_error"]
+            else:
+                if result.get("empty"):
+                    announcement = (
+                        f"📭 Recorded empty **#{ch.name}** — verified 0 messages; "
+                        f"no channel page created: {url}"
+                    )
+                else:
+                    announcement = (
+                        f"📚 Archived **#{ch.name}** — {result['messages']} messages, "
+                        f"{result['attachments']} attachment(s): {url}"
+                    )
+                try:
+                    await archives_channel.send(announcement)
+                except Exception as exc:
+                    logging.exception("Failed to post archive URL to #archives")
+                    result["announcement_error"] = f"could not post the archive URL to #archives: {exc}"
+                    result["error"] = result["announcement_error"]
+                else:
+                    announced_ok = True
+                    # Guard against a duplicate later in this same batch.
+                    announced_urls.add(url)
+            if announced_ok:
+                try:
+                    # The deletion marker is written only after the announcement.
+                    # If finalisation fails, the staged page remains incomplete and
+                    # `/delete` continues to block it without a compensating edit.
+                    if result.get("empty"):
+                        await finalize_empty_archive(client, result)
+                    else:
+                        await finalize_archive(client, result)
+                except Exception as exc:
+                    logging.exception("Failed to finalise archive for #%s", ch.name)
+                    result["error"] = f"announcement posted, but final verification failed: {exc}"
+                    result["ok"] = False
+        elif result.get("ready"):
+            result["announcement_error"] = "#archives channel was not found"
+            result["error"] = result["announcement_error"]
+
+        # Do not retain large staged/final page bodies in the summary list.
+        for key in ("_final_text", "_stream_boundaries", "_part_manifest", "_attachment_manifest", "_external_manifest", "_empty_record"):
+            result.pop(key, None)
+
+        if result.get("ok") and result.get("empty"):
+            counts["empty"] += 1
+            logging.info("Publish %d/%d%s: #%s recorded empty on the Skipped list.", index, total, label_note, ch.name)
+        elif result.get("ok"):
+            counts["published"] += 1
+            logging.info(
+                "Publish %d/%d%s: #%s published (%d msgs, %d attachment(s): %d reused, %d uploaded, %d on NAS)%s.",
+                index, total, label_note, ch.name, result.get("messages", 0),
+                result.get("attachments", 0), result.get("reused_attachments", 0),
+                result.get("uploaded_attachments", 0), result.get("nas_attachments", 0),
+                " via reused announcement" if result.get("announcement_reused") else "",
+            )
+        else:
+            counts["failed"] += 1
+            logging.warning("Publish %d/%d%s: #%s FAILED — %s", index, total, label_note, ch.name, result.get("error", "unverified"))
+
+    logging.info(
+        "Publish complete: %d unchanged, %d published/repaired, %d empty recorded, %d failed (of %d).",
+        counts["unchanged"], counts["published"], counts["empty"], counts["failed"], total,
+    )
+
+    ok = [r for r in results if r.get("ok")]
+    bad = [r for r in results if not r.get("ok")]
+    lines = [
+        f"✅ Reconciled {total} channel(s): {counts['unchanged']} unchanged, "
+        f"{counts['published']} published/repaired, {counts['empty']} empty recorded, "
+        f"{counts['failed']} failed."
+    ]
+    if missing_channel_names:
+        lines.append("⚠️ Unmatched channel names: " + ", ".join(f"`{n}`" for n in missing_channel_names))
+    for r in ok[:15]:
+        ch = r["channel"]
+        if r.get("unchanged"):
+            lines.append(f"• #{ch.name} — already archived (unchanged)")
+        elif r.get("empty"):
+            lines.append(f"• #{ch.name} → <{r['url']}> (empty; recorded on the Skipped list)")
+        else:
+            reused = " (reused announcement)" if r.get("announcement_reused") else ""
+            lines.append(f"• #{ch.name} → <{r['url']}> ({r['messages']} msgs){reused}")
+        if r.get("announcement_error"):
+            lines.append(f"  ⚠️ {r['announcement_error']}")
+    if len(ok) > 15:
+        lines.append(f"• …and {len(ok) - 15} more OK (see #archives)")
+    if bad:
+        lines.append(f"⚠️ **Failed/unverified ({len(bad)}) — do NOT delete these:**")
+        for r in bad:
+            lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
+    # Discord limits a message to 2000 characters; paginate rather than silently
+    # dropping failure names after the first chunk. A long run (many channels /
+    # large NAS downloads) can outlive Discord's ~15-minute interaction-token
+    # lifetime, after which followup.send() 401s ("Invalid Webhook Token") and the
+    # token cannot be refreshed. Fall back to a normal channel message (sent over
+    # the bot's gateway connection, which does not expire) so the summary — and
+    # especially the "do NOT delete these" failures — is never lost.
+    fallback_channel = (
+        interaction.channel
+        if isinstance(interaction.channel, discord.TextChannel)
+        else archives_channel
+    )
+    interaction_alive = True
+    for chunk in _paginate_lines(lines):
+        if interaction_alive:
+            try:
+                await interaction.followup.send(chunk, ephemeral=True)
+                continue
+            except Exception:
+                interaction_alive = False
+                logging.warning(
+                    "Publish interaction expired; posting the summary to #%s instead.",
+                    getattr(fallback_channel, "name", "?"),
+                )
+        if fallback_channel is not None:
+            try:
+                await fallback_channel.send(chunk)
+            except Exception:
+                logging.exception("Failed to post publish summary to a channel")
+        else:
+            logging.error("No channel available for the publish summary; it was:\n%s", chunk)
+
+
+# ---- /wiki_status command (verify archive wiki connectivity) ----
+@tree.command(name="wiki_status", description="Check the archive wiki connection and bot permissions.")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def wiki_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        client = await get_wiki_client()
+        info = await client.userinfo()
+        generator = await client.site_generator()
+        rights = info.get("rights", [])
+        bypasses_rate_limits = "noratelimit" in rights
+        await interaction.followup.send(
+            f"✅ Connected to **{generator}**\n"
+            f"Bot user: `{info.get('name')}` (groups: {', '.join(info.get('groups', [])) or 'none'})\n"
+            f"Can edit: {'yes' if 'edit' in rights else '**NO**'} | "
+            f"upload: {'yes' if 'upload' in rights else '**NO**'}\n"
+            f"Rate-limit bypass: {'yes' if bypasses_rate_limits else '**NO** — bounded backoff enabled'}\n"
+            f"Archive namespace: `{WIKI_CONFIG['MEDIAWIKI_ARCHIVE_NAMESPACE']}`",
+            ephemeral=True,
+        )
+    except Exception as exc:
+        logging.exception("wiki_status failed")
+        await interaction.followup.send(f"❌ Wiki connection failed: {exc}", ephemeral=True)
+
+
+bot.run(TOKEN)

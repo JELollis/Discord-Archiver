@@ -1,7 +1,35 @@
 web.config
 /.idea
 /__pycache__
+__pycache__/
+*.py[cod]
 Bot Key.txt
 /logs
 quick_update.py
 /venv
+
+# --- Sensitive deployment material: keep in the repo dir, never commit ---
+/private/
+deployment-worksheet.md
+
+# Secrets, credentials, environment
+*.env
+.env
+.env.*
+*.secret
+*.secrets
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+private.php
+LocalSettings.php
+wiki.env
+*token*
+*password*
+*credentials*
+
+# Claude Code session dir
+/.claude/
+HANDOFF.md
