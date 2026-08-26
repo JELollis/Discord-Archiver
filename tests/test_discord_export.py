@@ -123,6 +123,17 @@ class DiscordExportTests(unittest.TestCase):
             discord_export.render_external_manifest([])
         ), [])
 
+    def test_nas_filename_preserves_original_name_but_blocks_traversal(self):
+        # The original name is kept as-is so a shared file resolves to one path.
+        self.assertEqual(discord_export.nas_filename("winPreVista.iso"), "winPreVista.iso")
+        self.assertEqual(discord_export.nas_filename("Wireshark-4.2.0-x64.exe"), "Wireshark-4.2.0-x64.exe")
+        self.assertEqual(discord_export.nas_filename("My Lecture (1).mkv"), "My Lecture (1).mkv")
+        # Path separators are stripped to the leaf; empty/dot names fall back.
+        self.assertEqual(discord_export.nas_filename("../../etc/passwd"), "passwd")
+        self.assertEqual(discord_export.nas_filename("a\\b\\c.iso"), "c.iso")
+        self.assertEqual(discord_export.nas_filename("/"), "attachment")
+        self.assertEqual(discord_export.nas_filename(".."), "attachment")
+
     def test_nas_attachment_renders_as_external_link(self):
         wikitext = discord_export._render_attachment({
             "filename": "winPreVista.iso",

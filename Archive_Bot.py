@@ -454,15 +454,15 @@ def _annotate_nas_attachment(att: dict, nas_name: str, digest: str, size: int) -
 
 
 def _reuse_nas_attachment(
-    channel_name: str,
-    message_id: int,
     att: dict,
     existing_external: dict[str, tuple[str, int]],
 ) -> bool:
-    """Reuse a NAS-stored attachment already present with its recorded size."""
-    nas_name = discord_export.attachment_upload_name(
-        channel_name, message_id, att["id"], att["filename"]
-    )
+    """Reuse a NAS-stored attachment already recorded on the page, by size.
+
+    Fast path for re-publish: trusts the recorded SHA-1 without re-hashing a
+    possibly multi-gigabyte file, provided the share still holds it at that size.
+    """
+    nas_name = discord_export.nas_filename(att["filename"])
     entry = existing_external.get(nas_name)
     if entry is None:
         return False
@@ -479,21 +479,34 @@ def _reuse_nas_attachment(
 
 async def _archive_to_nas(
     channel_name: str, message_id: int, att: dict, obj, nas_max: int, chunk_size: int,
-) -> None:
-    """Stream an oversize/NAS-designated attachment to the file share and link it.
+) -> bool:
+    """Store an oversize/NAS-designated attachment on the file share and link it.
 
-    Downloads straight to the share (never the small root disk), verifies the
-    stored size, then annotates the attachment with its public URL + SHA-1/size so
-    the page links it and the deletion gate can verify it exists and is intact.
+    The file keeps its original name. If the share already holds a file by that
+    name (the user's software repository often already has it), it is linked as-is
+    without re-downloading or overwriting. Otherwise it is streamed straight to the
+    share (never the small root disk). Either way the attachment is annotated with
+    its public URL + SHA-1/size so the page links it and the deletion gate can
+    verify it. Returns True when an existing file was reused, False when downloaded.
     """
-    nas_name = discord_export.attachment_upload_name(
-        channel_name, message_id, att["id"], att["filename"]
-    )
+    nas_name = discord_export.nas_filename(att["filename"])
     final_path = _nas_path(nas_name)
+    try:
+        already_present = await asyncio.to_thread(final_path.is_file)
+    except OSError:
+        already_present = False
+    if already_present:
+        digest, size = await asyncio.to_thread(file_sha1_and_size, final_path)
+        logging.info(
+            "Linking existing NAS file for #%s msg %s: %r (%d bytes).",
+            channel_name, message_id, nas_name, size,
+        )
+        _annotate_nas_attachment(att, nas_name, digest, size)
+        return True
     part_path = final_path.with_name(final_path.name + ".part")
     expected_size = int(att.get("size", 0))
     logging.info(
-        "Staging oversize/NAS attachment #%s msg %s: %r (%d bytes) -> %s",
+        "Downloading oversize/NAS attachment #%s msg %s: %r (%d bytes) -> %s",
         channel_name, message_id, att["filename"], expected_size, final_path,
     )
     try:
@@ -513,6 +526,7 @@ async def _archive_to_nas(
             pass
         raise
     _annotate_nas_attachment(att, nas_name, digest, size)
+    return False
 
 
 async def archive_attachments(
@@ -567,7 +581,7 @@ async def archive_attachments(
                 )
                 continue
             if nas_enabled and existing_external and _reuse_nas_attachment(
-                channel_name, m["id"], att, existing_external
+                att, existing_external
             ):
                 nas_reused += 1
                 logging.info(
@@ -584,8 +598,10 @@ async def archive_attachments(
             )
             try:
                 if route_to_nas:
-                    await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size)
-                    nas_uploaded += 1
+                    if await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size):
+                        nas_reused += 1
+                    else:
+                        nas_uploaded += 1
                     continue
                 expected_size = int(att.get("size", 0))
                 logging.info(
@@ -653,8 +669,10 @@ async def archive_attachments(
                 # (re-downloading straight to the share) when it is available.
                 if nas_enabled and not route_to_nas:
                     try:
-                        await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size)
-                        nas_uploaded += 1
+                        if await _archive_to_nas(channel_name, m["id"], att, obj, nas_max, chunk_size):
+                            nas_reused += 1
+                        else:
+                            nas_uploaded += 1
                         continue
                     except Exception as nas_exc:
                         att["error"] = f"too large for the wiki and the NAS store failed: {nas_exc}"

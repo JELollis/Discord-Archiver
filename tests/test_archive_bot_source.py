@@ -230,6 +230,32 @@ class ArchiveBotSourceTests(unittest.TestCase):
         )
         self.assertTrue(handles_too_large)
 
+    def test_nas_store_reuses_existing_file_before_downloading(self):
+        """_archive_to_nas must check the share (is_file) before staging a download."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "_archive_to_nas")
+        is_file_line = min(
+            (node.lineno for node in ast.walk(function)
+             if isinstance(node, ast.Attribute) and node.attr == "is_file"),
+            default=None,
+        )
+        stage_line = min(
+            (node.lineno for node in ast.walk(function)
+             if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+             and node.func.id == "stage_discord_attachment"),
+            default=None,
+        )
+        self.assertIsNotNone(is_file_line, "_archive_to_nas must test for an existing file")
+        self.assertIsNotNone(stage_line)
+        self.assertLess(is_file_line, stage_line)
+        # And it must store under the original name, not the mangled wiki name.
+        uses_nas_filename = any(
+            isinstance(node, ast.Attribute) and node.attr == "nas_filename"
+            for node in ast.walk(function)
+        )
+        self.assertTrue(uses_nas_filename)
+
     def test_deletion_gate_verifies_external_nas_manifest(self):
         """is_channel_archived must verify NAS-hosted attachments too."""
         tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))

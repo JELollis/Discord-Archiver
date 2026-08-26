@@ -389,6 +389,21 @@ def attachment_upload_name(channel_name: str, message_id: int, attachment_id: in
     return sanitize_filename(f"{message_id}-{attachment_id}-{channel_name}-{filename}")
 
 
+def nas_filename(filename: str) -> str:
+    """Leaf filename for NAS storage — preserves the original name.
+
+    Unlike the wiki upload name, NAS files keep their real Discord filename (the
+    share is a human-browsable software repository). Only path separators are
+    stripped so a crafted name cannot escape the storage directory; the name is
+    otherwise left untouched, so two archives referencing the same-named file
+    resolve to (and share) the same stored file.
+    """
+    leaf = str(filename).replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if leaf in ("", ".", ".."):
+        return "attachment"
+    return leaf
+
+
 def zip_fallback_upload_name(upload_name: str) -> str:
     """Return a ZIP name that cannot retain a blacklisted compound extension.
 
