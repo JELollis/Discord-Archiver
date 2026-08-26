@@ -2307,13 +2307,37 @@ async def publish(
         lines.append(f"⚠️ **Failed/unverified ({len(bad)}) — do NOT delete these:**")
         for r in bad:
             lines.append(f"• #{r['channel'].name}: {r.get('error', 'read-back verification failed')}")
-    try:
-        # Discord limits a message to 2000 characters; paginate rather than
-        # silently dropping failure names after the first chunk.
-        for chunk in _paginate_lines(lines):
-            await interaction.followup.send(chunk, ephemeral=True)
-    except Exception:
-        logging.exception("Failed to send publish summary (interaction may have expired)")
+    # Discord limits a message to 2000 characters; paginate rather than silently
+    # dropping failure names after the first chunk. A long run (many channels /
+    # large NAS downloads) can outlive Discord's ~15-minute interaction-token
+    # lifetime, after which followup.send() 401s ("Invalid Webhook Token") and the
+    # token cannot be refreshed. Fall back to a normal channel message (sent over
+    # the bot's gateway connection, which does not expire) so the summary — and
+    # especially the "do NOT delete these" failures — is never lost.
+    fallback_channel = (
+        interaction.channel
+        if isinstance(interaction.channel, discord.TextChannel)
+        else archives_channel
+    )
+    interaction_alive = True
+    for chunk in _paginate_lines(lines):
+        if interaction_alive:
+            try:
+                await interaction.followup.send(chunk, ephemeral=True)
+                continue
+            except Exception:
+                interaction_alive = False
+                logging.warning(
+                    "Publish interaction expired; posting the summary to #%s instead.",
+                    getattr(fallback_channel, "name", "?"),
+                )
+        if fallback_channel is not None:
+            try:
+                await fallback_channel.send(chunk)
+            except Exception:
+                logging.exception("Failed to post publish summary to a channel")
+        else:
+            logging.error("No channel available for the publish summary; it was:\n%s", chunk)
 
 
 # ---- /wiki_status command (verify archive wiki connectivity) ----

@@ -284,6 +284,28 @@ class ArchiveBotSourceTests(unittest.TestCase):
             for node in ast.walk(function)
         ))
 
+    def test_publish_summary_falls_back_to_a_channel_when_interaction_expires(self):
+        """A long run outlives the interaction token; the summary must not be lost."""
+        tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
+        function = self._async_function(tree, "publish")
+        assigns_fallback = any(
+            isinstance(node, ast.Name) and node.id == "fallback_channel"
+            for node in ast.walk(function)
+        )
+        # The summary section must both try the interaction and send via a channel.
+        followup_send = any(
+            isinstance(node, ast.Attribute) and node.attr == "send"
+            and isinstance(node.value, ast.Attribute) and node.value.attr == "followup"
+            for node in ast.walk(function)
+        )
+        channel_send = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute) and node.func.attr == "send"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "fallback_channel"
+            for node in ast.walk(function)
+        )
+        self.assertTrue(assigns_fallback and followup_send and channel_send)
+
     def test_publish_only_trusts_bot_authored_announcements(self):
         """Announcement reuse must gate on the bot's own authorship of #archives posts."""
         tree = ast.parse(ARCHIVE_BOT_PATH.read_text(encoding="utf-8"))
